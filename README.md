@@ -20,3 +20,4 @@ Inactivity alone does not establish that the owner has died.
 
 - [Project concept](docs/concept.md) — a discussion of possible features, inheritance scenarios, trust relationships, and design approaches.
 - [Version 1 scope](docs/v1.md) — the initial feature set, activity checks, guardian confirmations, and delivery of assigned secrets.
+- [Version 1 technical specification](docs/v1-technical-spec.md) — architecture, technology stack, encryption, storage, delivery workflows, and deployment.
