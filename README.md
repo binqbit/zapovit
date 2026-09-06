@@ -1,33 +1,19 @@
 # Zapovit
 
-Zapovit is a digital inheritance service for passing cryptocurrency assets, passwords, documents, and other important information to trusted recipients when the owner can no longer manage them.
+Zapovit is a digital inheritance project for passing sensitive information and access to digital assets to trusted people after the owner's death or when they can no longer manage their affairs.
 
-It combines periodic activity confirmations, approval from trusted contacts, and predefined rules for releasing access.
+## What it covers
+
+- Passwords, account credentials, and recovery information.
+- Private documents, instructions, and other sensitive records.
+- Cryptocurrency wallet recovery information and access to digital assets.
 
 ## How it works
 
-1. **Set up a plan.** The owner selects recipients, assigns information or assets, and configures inactivity periods and approval requirements.
-2. **Choose trusted contacts.** Guardians help verify the circumstances and authorize activation. A plan can require a quorum, such as three out of five approvals.
-3. **Confirm activity.** The owner responds to Telegram reminders and periodically completes a stronger authentication check in the application.
-4. **Review inactivity.** Missed confirmations trigger additional reminders, a grace period, and requests for guardians to review the situation.
-5. **Release access.** Once the required approvals and waiting period are complete, recipients can access their assigned information or claim assets. The owner can cancel the process before release.
+The owner decides what to pass on, who should receive it, and under which conditions. Activity confirmations and review by trusted contacts can help determine when to begin the transfer process. Access can be released in stages, from essential instructions to more sensitive information or assets.
 
-Inactivity starts the verification process; it is not treated as proof of death.
+Inactivity alone does not establish that the owner has died.
 
-## Transfer mechanisms
+## Documentation
 
-### Encrypted information
-
-Sensitive information is organized into encrypted packages for designated recipients. Encrypted copies can be shared in advance, with the key material needed to unlock them released through the recovery process.
-
-Approval rules determine when release is authorized. Cryptographic key sharing can additionally require several independent shares to reconstruct a key.
-
-### Cryptocurrency assets
-
-Wallet recovery instructions can be delivered as encrypted information. For predefined asset allocations, a smart wallet or contract records beneficiaries and their shares.
-
-The owner periodically submits an authenticated heartbeat. When the configured inactivity, approval, and waiting conditions are met, beneficiaries can claim their allocation from assets controlled by the wallet or contract.
-
-## Owner control
-
-The owner manages recipients, guardians, check-in schedules, and release conditions. Guardians authorize the process, while recipients receive the information or assets assigned to them; these roles can belong to different people.
+- [Project concept](docs/concept.md) — a discussion of possible features, inheritance scenarios, trust relationships, and design approaches.
