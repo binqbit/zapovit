@@ -17,6 +17,9 @@ mod transport_validation;
 #[path = "pipeline_cases/menu_navigation.rs"]
 mod menu_navigation;
 
+#[path = "pipeline_cases/draft_navigation.rs"]
+mod draft_navigation;
+
 #[path = "pipeline/validation_controls.rs"]
 mod validation_controls;
 

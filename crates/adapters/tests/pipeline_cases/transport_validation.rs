@@ -91,8 +91,22 @@ async fn slash_commands_are_limited_but_stop_and_sensitive_cleanup_still_work() 
             .unwrap();
     }
     ui.handle(100, &update(501, 9001, "/start")).await.unwrap();
-    assert_eq!(requests.load(Ordering::Relaxed), 0);
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    ui.handle(100, &update(504, 9001, "/start")).await.unwrap();
+    ui.handle(100, &update(505, 9001, "/settings"))
+        .await
+        .unwrap();
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        1,
+        "limit feedback is sent once per minute"
+    );
     ui.handle(100, &update(502, 9001, "/stop")).await.unwrap();
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        2,
+        "STOP confirmation bypasses the ordinary limit"
+    );
     let mut tx = f.engine.db.begin().await.unwrap();
     assert_eq!(
         get::<Plan>(&mut *tx, plan).await.unwrap().state,
@@ -232,8 +246,12 @@ async fn emergency_priority_is_bound_to_the_current_owner() {
         .unwrap();
     assert_eq!(
         requests.load(Ordering::Relaxed),
-        0,
-        "nonowner emergency commands use the normal quota"
+        1,
+        "nonowner emergency commands use the normal quota and get limit feedback"
+    );
+    assert_eq!(
+        f.engine.own_plan(owner.id).await.unwrap().1.state,
+        PlanState::Setup
     );
     let (mut profile, _) = f.engine.own_plan(owner.id).await.unwrap();
     profile.owner_epoch += 1;

@@ -4,9 +4,9 @@ use axum::{Json, Router, extract::Path, routing::post};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-type Screens = Arc<Mutex<Vec<(String, Value)>>>;
+pub(super) type Screens = Arc<Mutex<Vec<(String, Value)>>>;
 
-fn labels(body: &Value) -> Vec<&str> {
+pub(super) fn labels(body: &Value) -> Vec<&str> {
     body["reply_markup"]["inline_keyboard"]
         .as_array()
         .unwrap()
@@ -15,20 +15,20 @@ fn labels(body: &Value) -> Vec<&str> {
         .map(|button| button["text"].as_str().unwrap())
         .collect()
 }
-fn button(body: &Value, label: &str) -> String {
+pub(super) fn button(body: &Value, label: &str) -> String {
     body["reply_markup"]["inline_keyboard"].as_array().unwrap().iter()
         .flat_map(|row| row.as_array().unwrap()).find(|button| button["text"] == label)
         .unwrap_or_else(|| panic!("Missing button {label}; visible: {:?}", labels(body)))
         ["callback_data"].as_str().unwrap().into()
 }
-async fn last(screens: &Screens) -> Value {
+pub(super) async fn last(screens: &Screens) -> Value {
     screens.lock().await.last().unwrap().1.clone()
 }
-async fn press(ui: &BotUi, screens: &Screens, seq: &mut i64, user: i64, label: &str) {
+pub(super) async fn press(ui: &BotUi, screens: &Screens, seq: &mut i64, user: i64, label: &str) {
     let data = button(&last(screens).await, label);
     callback(ui, seq, user, data).await;
 }
-async fn callback(ui: &BotUi, seq: &mut i64, user: i64, data: String) {
+pub(super) async fn callback(ui: &BotUi, seq: &mut i64, user: i64, data: String) {
     *seq += 1;
     ui.handle(
         100,
@@ -40,7 +40,7 @@ async fn callback(ui: &BotUi, seq: &mut i64, user: i64, data: String) {
     .await
     .unwrap();
 }
-async fn command(ui: &BotUi, seq: &mut i64, user: i64, text: &str) {
+pub(super) async fn command(ui: &BotUi, seq: &mut i64, user: i64, text: &str) {
     *seq += 1;
     ui.handle(
         100,
@@ -146,7 +146,7 @@ async fn menus_group_settings_localize_and_preserve_owner_controls() {
     press(&ui, &screens, &mut seq, 7101, "Головне меню").await;
     press(&ui, &screens, &mut seq, 7101, "Налаштування").await;
     press(&ui, &screens, &mut seq, 7101, "Доступ і відновлення").await;
-    assert!(labels(&last(&screens).await).contains(&"Замінити recovery-ключ"));
+    assert!(labels(&last(&screens).await).contains(&"Замінити ключ відновлення"));
     press(&ui, &screens, &mut seq, 7101, "← Назад").await;
     let delete = button(&last(&screens).await, "Видалити назавжди");
     press(&ui, &screens, &mut seq, 7101, "Видалити назавжди").await;
@@ -180,7 +180,7 @@ async fn menus_group_settings_localize_and_preserve_owner_controls() {
     callback(&ui, &mut seq, 7102, delete).await;
     assert_eq!(
         last(&screens).await["text"],
-        adapters::localization::tr("en", "invalid-input")
+        adapters::localization::tr("en", "stale-action")
     );
     assert_eq!(
         f.engine.own_plan(owner.id).await.unwrap().1.state,

@@ -10,6 +10,7 @@ use serde_json::Value;
 use teloxide_core::types::MessageEntityKind;
 use zeroize::Zeroizing;
 
+mod drafts;
 mod menus;
 use menus::Menu;
 
@@ -144,7 +145,16 @@ impl BotUi {
     async fn load_dialog(&self, a: &Account) -> Result<Dialog> {
         let mut tx = self.engine.db.begin().await?;
         let d: Dialog = get(&mut *tx, a.id).await?;
-        if d.expires_at <= tx.now().await? {
+        let now = tx.now().await?;
+        if let Some(draft_id) = d.draft_id {
+            let draft: Draft = get(&mut *tx, draft_id).await?;
+            if draft.saved_secret.is_some()
+                || draft.expires_at <= now
+                || draft.created_at + 3600 <= now
+            {
+                return Err(RuleError::Expired.into());
+            }
+        } else if d.expires_at <= now {
             return Err(RuleError::Expired.into());
         }
         if let Some(id) = d.plan_id {
@@ -203,8 +213,39 @@ impl BotUi {
             }
             // A blocked recipient or an uncertain UI reply must not poison the
             // shared inbox. Domain/storage failures above remain retryable.
-            if !matches!(error, Error::MessageUnavailable | Error::RateLimited) {
-                match self.say(&a, "invalid-input", vec![]).await {
+            let feedback_allowed = if matches!(error, Error::RateLimited) {
+                match self
+                    .engine
+                    .limit(&format!("ui-limit-notice:{}", a.id), 1, 60)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(Error::RateLimited) => false,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                true
+            };
+            if feedback_allowed && !matches!(error, Error::MessageUnavailable) {
+                let key = match error {
+                    Error::RateLimited => "rate-limited",
+                    Error::InvalidCode => "invalid-code",
+                    Error::Rule(RuleError::Expired | RuleError::StaleAction) => "stale-action",
+                    Error::Rule(RuleError::NotReady) => "not-ready",
+                    Error::Rule(RuleError::QuotaExceeded) => "quota-exceeded",
+                    Error::Rule(RuleError::InvalidPolicy) => "invalid-policy",
+                    Error::Rule(RuleError::InvalidState) => "invalid-state",
+                    _ => "invalid-input",
+                };
+                let mut buttons = Vec::new();
+                if let Some(d) = self.active_draft(&a).await? {
+                    buttons.push(
+                        self.draft_button(&a, &d, "continue", "continue-draft")
+                            .await?,
+                    );
+                }
+                buttons.push(self.nav(&a, "home").await?);
+                match self.say(&a, key, buttons).await {
                     Ok(_) | Err(Error::MessageUnavailable) => {}
                     Err(error) => return Err(error),
                 }
@@ -261,8 +302,12 @@ impl BotUi {
         let menu_message = c["message"]["message_id"].as_i64();
         match action.name.as_str() {
             "create" => {
-                if self.engine.own_plan(a.id).await.is_err() {
-                    self.engine.create_profile(a.id).await?;
+                match self.engine.own_plan(a.id).await {
+                    Ok(_) => {}
+                    Err(Error::NotFound) => {
+                        self.engine.create_profile(a.id).await?;
+                    }
+                    Err(error) => return Err(error),
                 }
                 self.say(a, "created", vec![self.nav(a, "plan-menu").await?])
                     .await?;
@@ -323,113 +368,11 @@ impl BotUi {
                     .await?;
             }
             "new-secret" => {
-                let plan = plan.ok_or(Error::InvalidInput)?;
-                let draft = self.engine.new_draft(a.id, plan).await?;
-                self.dialog(a, "builder", Some(plan), Some(draft)).await?;
-                self.builder(a).await?;
-            }
-            "text" | "copyable" | "spoiler" | "file" => {
-                let mut d = self.load_dialog(a).await?;
-                if d.draft_id != target {
-                    return Err(RuleError::StaleAction.into());
-                }
-                d.step = action.name.clone();
-                self.store_dialog(&d).await?;
-                self.say(a, "block-prompt", vec![]).await?;
-            }
-            "choose-guardians" => {
-                let mut d = self.load_dialog(a).await?;
-                d.step = "guardians".into();
-                d.selected = d.guardians.clone();
-                self.store_dialog(&d).await?;
-                self.select_people(a, &d).await?;
-            }
-            "toggle" => {
-                let mut d = self.load_dialog(a).await?;
-                let id = target.ok_or(Error::InvalidInput)?;
-                if !d.selected.remove(&id) {
-                    d.selected.insert(id);
-                }
-                self.store_dialog(&d).await?;
-                self.select_people(a, &d).await?;
-            }
-            "done" => {
-                let mut d = self.load_dialog(a).await?;
-                match d.step.as_str() {
-                    "guardians" => {
-                        if d.selected.is_empty() || d.selected.len() > 10 {
-                            return Err(Error::InvalidInput);
-                        }
-                        d.guardians = d.selected.clone();
-                        d.selected = d.recipients.clone();
-                        d.step = "recipients".into();
-                        self.store_dialog(&d).await?;
-                        self.select_people(a, &d).await?;
-                    }
-                    "recipients" => {
-                        if d.selected.is_empty() || d.selected.len() > 10 {
-                            return Err(Error::InvalidInput);
-                        }
-                        d.recipients = d.selected.clone();
-                        d.step = "threshold".into();
-                        self.store_dialog(&d).await?;
-                        let mut buttons = vec![];
-                        for n in 1..=d.guardians.len() {
-                            buttons.push(
-                                self.button(
-                                    a,
-                                    &format!("threshold-{n}"),
-                                    d.draft_id,
-                                    d.plan_id,
-                                    true,
-                                    &n.to_string(),
-                                )
-                                .await?,
-                            );
-                        }
-                        self.say(a, "choose-threshold", buttons).await?;
-                    }
-                    _ => return Err(Error::InvalidInput),
-                }
-            }
-            name if name.starts_with("threshold-") => {
-                let mut d = self.load_dialog(a).await?;
-                d.threshold = name[10..].parse().map_err(|_| Error::InvalidInput)?;
-                d.step = "timing".into();
-                self.store_dialog(&d).await?;
-                self.say(a, "choose-timing", vec![]).await?;
-            }
-            "preview" => {
-                let d = self.load_dialog(a).await?;
-                let blocks = self
-                    .engine
-                    .draft_blocks(a.id, d.draft_id.ok_or(Error::InvalidInput)?)
+                self.start_draft(a, plan.ok_or(Error::InvalidInput)?, menu_message)
                     .await?;
-                let preview = blocks
-                    .into_iter()
-                    .map(|block| match &block {
-                        Block::File { name, caption, .. } => Block::Text {
-                            text: format!("{name}\n{caption}"),
-                        },
-                        _ => block,
-                    })
-                    .collect();
-                for block in delivery_blocks(preview) {
-                    if let SendResult::Sent(id) =
-                        self.telegram.send_block(a.chat_id, &block, None).await
-                    {
-                        self.track_preview(a, &d, id).await?;
-                    }
-                }
-                self.ready(a, &d).await?;
             }
-            "save" => {
-                let d = self.load_dialog(a).await?;
-                self.engine
-                    .save(a.id, d.draft_id.ok_or(Error::InvalidInput)?)
-                    .await?;
-                self.say(a, "saved", vec![self.back(a, "plan-menu").await?])
-                    .await?;
+            name if name.starts_with("draft:") => {
+                self.draft_callback(a, &action, menu_message).await?;
             }
             "ack-grant" => {
                 self.engine
@@ -464,10 +407,24 @@ impl BotUi {
                 {
                     return Err(RuleError::AccessDenied.into());
                 }
+                let plan_record: Plan = get(&mut *tx, secret.plan_id).await?;
+                let profile: Profile = get(&mut *tx, plan_record.profile_id).await?;
+                let owner: Account = get(&mut *tx, profile.owner_id).await?;
+                let prompt = format!(
+                    "{}\n\n{}: {}\n{}: {}",
+                    tr(&a.locale, "code-prompt"),
+                    tr(&a.locale, "owner-label"),
+                    owner.telegram_id,
+                    tr(&a.locale, "secret-reference"),
+                    secret.id
+                );
                 tx.commit().await?;
                 let mut d = self.dialog(a, "code", plan, None).await?;
                 d.case_id = Some(case_id);
-                d.reply_to = Some(self.say(a, "code-prompt", vec![]).await?);
+                d.reply_to = Some(match self.telegram.send_prompt(a.chat_id, &prompt).await {
+                    SendResult::Sent(id) => id,
+                    _ => return Err(Error::MessageUnavailable),
+                });
                 self.store_dialog(&d).await?;
             }
             "guardians" => self.guardians(a).await?,
@@ -522,7 +479,11 @@ impl BotUi {
             "delete" => {
                 self.say(
                     a,
-                    "delete-confirm",
+                    if target.is_some() {
+                        "delete-secret-confirm"
+                    } else {
+                        "delete-confirm"
+                    },
                     vec![
                         self.b(a, "delete-confirmed", target, plan, true).await?,
                         self.back(
@@ -649,6 +610,14 @@ impl BotUi {
                     self.say(a, "recovery-prompt", vec![]).await?;
                 }
                 "/guardians" => self.guardians(a).await?,
+                "/help" => {
+                    self.say(
+                        a,
+                        "help-text",
+                        vec![self.nav(a, "home").await?, self.nav(a, "settings").await?],
+                    )
+                    .await?;
+                }
                 "/settings" => self.menu(a, Menu::Settings, None).await?,
                 "/status" => {
                     let (_, plan) = self.engine.own_plan(a.id).await?;
@@ -677,7 +646,7 @@ impl BotUi {
                     .await?;
                 d.step = "builder".into();
                 self.store_dialog(&d).await?;
-                self.builder(a).await?;
+                self.render_draft(a, &d, None).await?;
             }
             "file" => {
                 let doc = &m["document"];
@@ -727,30 +696,16 @@ impl BotUi {
                 self.say(a, "awaiting-file", vec![]).await?;
             }
             "timing" => {
-                let numbers = text
-                    .split_whitespace()
-                    .map(str::parse::<i64>)
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|_| Error::InvalidInput)?;
-                if numbers.len() != 3 || numbers.iter().any(|n| *n < 1 || *n > 365) {
-                    return Err(Error::InvalidInput);
-                }
-                let policy = Policy {
-                    guardians: d.guardians.clone(),
-                    recipients: d.recipients.clone(),
-                    threshold: d.threshold,
-                    timing: Timing {
-                        reminder_seconds: numbers[0] * DAY,
-                        inactivity_seconds: numbers[1] * DAY,
-                        release_delay_seconds: numbers[2] * DAY,
-                    },
+                let timing = match drafts::parse_timing(text) {
+                    Some(timing) => timing,
+                    None => {
+                        self.say(a, "invalid-timing", vec![]).await?;
+                        self.render_draft(a, &d, None).await?;
+                        return Ok(());
+                    }
                 };
-                self.engine
-                    .draft_policy(a.id, d.draft_id.ok_or(Error::InvalidInput)?, policy)
-                    .await?;
-                d.step = "ready".into();
-                self.store_dialog(&d).await?;
-                self.ready(a, &d).await?;
+                self.set_timing(a, &mut d, timing).await?;
+                self.render_draft(a, &d, None).await?;
             }
             "code" => {
                 if d.reply_to != m["reply_to_message"]["message_id"].as_i64() {
@@ -856,98 +811,6 @@ impl BotUi {
         .await?;
         Ok(())
     }
-    async fn builder(&self, a: &Account) -> Result<()> {
-        let d = self.load_dialog(a).await?;
-        let mut buttons = vec![];
-        for name in ["text", "copyable", "spoiler", "file", "choose-guardians"] {
-            buttons.push(self.b(a, name, d.draft_id, d.plan_id, true).await?);
-        }
-        self.say(a, "builder", buttons).await?;
-        Ok(())
-    }
-    async fn select_people(&self, a: &Account, d: &Dialog) -> Result<()> {
-        let mut tx = self.engine.db.begin().await?;
-        let people = list::<Participant>(&mut *tx, d.plan_id).await?;
-        let mut labels = vec![];
-        for p in people.into_iter().filter(|p| p.confirmed) {
-            let who: Account = get(&mut *tx, p.account_id).await?;
-            labels.push((
-                who.id,
-                format!(
-                    "{} {}",
-                    if d.selected.contains(&who.id) {
-                        "✓"
-                    } else {
-                        "○"
-                    },
-                    who.telegram_id
-                ),
-            ));
-        }
-        tx.commit().await?;
-        let mut buttons = vec![];
-        for (id, label) in labels {
-            buttons.push(
-                self.button(a, "toggle", Some(id), d.plan_id, true, &label)
-                    .await?,
-            );
-        }
-        buttons.push(self.b(a, "done", d.draft_id, d.plan_id, true).await?);
-        self.say(
-            a,
-            if d.step == "guardians" {
-                "choose-guardians"
-            } else {
-                "choose-recipients"
-            },
-            buttons,
-        )
-        .await?;
-        Ok(())
-    }
-    async fn ready(&self, a: &Account, d: &Dialog) -> Result<()> {
-        let mut tx = self.engine.db.begin().await?;
-        let draft: Draft = get(&mut *tx, d.draft_id.ok_or(Error::InvalidInput)?).await?;
-        let policy = draft.policy.ok_or(Error::InvalidInput)?;
-        let mut guardians = Vec::new();
-        let mut recipients = Vec::new();
-        for id in &policy.guardians {
-            guardians.push(get::<Account>(&mut *tx, *id).await?.telegram_id.to_string());
-        }
-        for id in &policy.recipients {
-            recipients.push(get::<Account>(&mut *tx, *id).await?.telegram_id.to_string());
-        }
-        tx.commit().await?;
-        self.text(
-            a,
-            &format!(
-                "{}: {}\n{}: {}\n{}: {} / {}\n{}: {} / {} / {}",
-                tr(&a.locale, "guardians-label"),
-                guardians.join(", "),
-                tr(&a.locale, "recipients-label"),
-                recipients.join(", "),
-                tr(&a.locale, "threshold-label"),
-                policy.threshold,
-                policy.guardians.len(),
-                tr(&a.locale, "timing-label"),
-                policy.timing.reminder_seconds / DAY,
-                policy.timing.inactivity_seconds / DAY,
-                policy.timing.release_delay_seconds / DAY
-            ),
-            vec![],
-        )
-        .await?;
-        self.say(
-            a,
-            "draft-ready",
-            vec![
-                self.b(a, "preview", d.draft_id, d.plan_id, true).await?,
-                self.b(a, "save", d.draft_id, d.plan_id, true).await?,
-            ],
-        )
-        .await?;
-        Ok(())
-    }
     async fn track_preview(&self, a: &Account, d: &Dialog, message_id: i64) -> Result<()> {
         let mut tx = self.engine.db.begin().await?;
         let mut draft: Draft = get(&mut *tx, d.draft_id.ok_or(Error::InvalidInput)?).await?;
@@ -970,8 +833,8 @@ impl BotUi {
                 "{}: {}\n{}: {}",
                 tr(&a.locale, "status"),
                 crate::localization::state(&a.locale, &plan.state),
-                tr(&a.locale, "checkin"),
-                plan.last_activity
+                tr(&a.locale, "last-checkin"),
+                drafts::display_time(plan.last_activity)
             ),
             vec![],
         )
@@ -1011,18 +874,26 @@ impl BotUi {
             .filter(|s| s.state != SecretState::Deleted && s.policy.guardians.contains(&a.id))
         {
             let mut buttons = vec![
-                self.b(
+                self.button(
                     a,
                     "request-cancel",
                     Some(secret.id),
                     Some(secret.plan_id),
                     false,
+                    &tr(&a.locale, "cancel-secret"),
                 )
                 .await?,
             ];
             buttons.push(
-                self.b(a, "request-cancel", None, Some(secret.plan_id), false)
-                    .await?,
+                self.button(
+                    a,
+                    "request-cancel",
+                    None,
+                    Some(secret.plan_id),
+                    false,
+                    &tr(&a.locale, "cancel-plan"),
+                )
+                .await?,
             );
             let mut tx = self.engine.db.begin().await?;
             let grants = list::<GuardianGrant>(&mut *tx, Some(secret.id)).await?;
@@ -1053,7 +924,18 @@ impl BotUi {
                     );
                 }
             }
-            self.text(a, &secret.id.to_string(), buttons).await?;
+            self.text(
+                a,
+                &format!(
+                    "{}: {}\n{}: {}",
+                    tr(&a.locale, "secret-reference"),
+                    secret.id,
+                    tr(&a.locale, "status"),
+                    crate::localization::state(&a.locale, &secret.state)
+                ),
+                buttons,
+            )
+            .await?;
             shown = true;
         }
         for c in cancellations
@@ -1062,7 +944,20 @@ impl BotUi {
         {
             self.text(
                 a,
-                &format!("{}\n{} / {}", c.id, c.votes.len(), c.members.len()),
+                &format!(
+                    "{}\n{}: {} / {}",
+                    tr(
+                        &a.locale,
+                        if c.secret_id.is_some() {
+                            "cancel-secret"
+                        } else {
+                            "cancel-plan"
+                        }
+                    ),
+                    tr(&a.locale, "cancellation-votes"),
+                    c.votes.len(),
+                    c.members.len()
+                ),
                 vec![
                     self.b(a, "vote-cancel", Some(c.id), Some(c.plan_id), false)
                         .await?,
@@ -1070,9 +965,6 @@ impl BotUi {
             )
             .await?;
             shown = true;
-        }
-        if !shown {
-            self.say(a, "no-items", vec![]).await?;
         }
         let mut tx = self.engine.db.begin().await?;
         let parts = find::<DeliveryPart>(&mut *tx, "recipient_id", &a.id.to_string()).await?;
@@ -1103,6 +995,10 @@ impl BotUi {
                 ],
             )
             .await?;
+            shown = true;
+        }
+        if !shown {
+            self.say(a, "no-items", vec![]).await?;
         }
         self.say(a, "guardians", vec![self.back(a, "home").await?])
             .await?;
@@ -1207,7 +1103,7 @@ impl BotUi {
                     d.step = "builder".into();
                     self.store_dialog(&d).await?;
                     self.say(&a, "block-saved", vec![]).await?;
-                    self.builder(&a).await?;
+                    self.render_draft(&a, &d, None).await?;
                 }
                 self.engine
                     .finish_job(job.id, job.lease_token, SendResult::Sent(0))
@@ -1218,6 +1114,7 @@ impl BotUi {
     }
     async fn send_notice_job(&self, job: Job) -> Result<()> {
         let mut tx = self.engine.db.begin().await?;
+        let mut guardian_secret = None;
         let (account, key, code, action, target) = match &job.task {
             Task::Notice {
                 account_id, key, ..
@@ -1230,6 +1127,7 @@ impl BotUi {
             ),
             Task::GuardianCode { grant_id } => {
                 let g: GuardianGrant = get(&mut *tx, *grant_id).await?;
+                guardian_secret = Some(g.secret_id);
                 if g.ready || g.expires_at <= tx.now().await? {
                     return Ok(());
                 }
@@ -1284,6 +1182,7 @@ impl BotUi {
                 account_id,
             } => {
                 let c: CaseRecord = get(&mut *tx, *case_id).await?;
+                guardian_secret = Some(c.secret_id);
                 if c.case.state != CaseState::Collecting {
                     return Ok(());
                 }
@@ -1297,8 +1196,27 @@ impl BotUi {
             }
             _ => return Err(Error::InvalidInput),
         };
+        let context = if let Some(secret_id) = guardian_secret {
+            let secret: Secret = get(&mut *tx, secret_id).await?;
+            let plan: Plan = get(&mut *tx, secret.plan_id).await?;
+            let profile: Profile = get(&mut *tx, plan.profile_id).await?;
+            let owner: Account = get(&mut *tx, profile.owner_id).await?;
+            Some(format!(
+                "{}: {}\n{}: {}",
+                tr(&account.locale, "owner-label"),
+                owner.telegram_id,
+                tr(&account.locale, "secret-reference"),
+                secret_id
+            ))
+        } else {
+            None
+        };
         tx.commit().await?;
         let mut text = Zeroizing::new(tr(&account.locale, key));
+        if let Some(context) = context {
+            text.push_str("\n\n");
+            text.push_str(&context);
+        }
         let mut entities = vec![];
         let mut buttons = vec![];
         if let Some(code) = code {

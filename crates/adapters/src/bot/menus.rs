@@ -59,6 +59,15 @@ impl BotUi {
             Menu::Plan => {
                 let plan = owned.as_ref().ok_or(Error::NotFound)?;
                 for name in ["secrets", "new-secret", "participants"] {
+                    if name == "new-secret"
+                        && let Some(d) = self.active_draft(a).await?
+                    {
+                        buttons.push(
+                            self.draft_button(a, &d, "continue", "continue-draft")
+                                .await?,
+                        );
+                        continue;
+                    }
                     buttons.push(self.b(a, name, None, Some(plan.id), true).await?);
                 }
                 if matches!(
@@ -112,10 +121,20 @@ impl BotUi {
                 tr(&a.locale, "recovery-options")
             }
         };
+        self.screen(a, &text, buttons, message).await
+    }
+
+    pub(super) async fn screen(
+        &self,
+        a: &Account,
+        text: &str,
+        buttons: Vec<(String, String)>,
+        message: Option<i64>,
+    ) -> Result<()> {
         if let Some(message) = message {
             match self
                 .telegram
-                .edit_menu(a.chat_id, message, &text, buttons.clone())
+                .edit_menu(a.chat_id, message, text, buttons.clone())
                 .await
             {
                 SendResult::Sent(_) => return Ok(()),
@@ -126,7 +145,7 @@ impl BotUi {
                 }
             }
         }
-        self.text(a, &text, buttons).await?;
+        self.text(a, text, buttons).await?;
         Ok(())
     }
 }

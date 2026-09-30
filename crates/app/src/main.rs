@@ -208,6 +208,11 @@ async fn serve(settings: Settings) -> Result<()> {
     startup("control_replay", engine.replay_controls().await)?;
     let (bot_id, username) = startup("telegram_get_me", telegram.me().await)?;
     startup("telegram_bot_binding", db.bind_bot(bot_id).await)?;
+    if telegram.configure_commands().await.is_err() {
+        // Command discovery is helpful, but its configuration must not prevent
+        // polling emergency STOP/check-in commands when Telegram rejects it.
+        tracing::warn!(event = "telegram_command_menu_failed");
+    }
     let ui = BotUi {
         engine: engine.clone(),
         telegram: telegram.clone(),

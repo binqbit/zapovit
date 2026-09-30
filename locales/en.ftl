@@ -42,10 +42,10 @@ spoiler = Hidden text
 file = File
 block-prompt = Send the content for this block. For a file, send a document with an optional caption.
 builder = Add text, a copyable block, hidden text or a file. When ready, select recipients and guardians.
-choose-guardians = Select guardians, then Done.
-choose-recipients = Select recipients, then Done.
+choose-guardians = Select the people who must confirm a release, then Done. Being a guardian does not itself grant access to the content.
+choose-recipients = Select who will receive the content, then Done. A recipient may also be a guardian.
 choose-threshold = Select how many guardians must confirm.
-choose-timing = Send three numbers in days: reminder interval, inactivity threshold and waiting period. Example: 7 28 7. Inactivity must be at least twice the reminder interval.
+choose-timing = Send three whole numbers in days: reminders (1–30), inactivity (2–365), waiting (1–30). Example: 7 28 7. Inactivity must be at least twice the reminder interval. You can correct the numbers here without restarting.
 preview = Preview the draft
 save = Save and encrypt
 draft-ready = Review the draft and its selected people. After Save, you cannot read or change its content or access rules.
@@ -60,7 +60,7 @@ recovery-prompt = Send your recovery key. Use /recoverstop to stop without trans
 recovery-pending = The plan is paused. Save and acknowledge your new recovery key to finish the transfer.
 recovered = Access restored. The plan remains stopped. Previously saved content cannot be read.
 error = This action could not be completed. Check the plan status before trying again.
-invalid-input = The input is invalid or this step has expired. Return to /start.
+invalid-input = This input could not be used. Check the current prompt and try again, or open the main menu.
 rate-limited = Too many attempts. Please wait before trying again. STOP and activity confirmation remain available.
 status = Status
 language = Language
@@ -94,3 +94,42 @@ state-partial = Partially delivered
 state-needs-attention = Needs attention
 state-delivered = Delivered
 draft-reset = Your unfinished draft was closed when the service restarted. Create a new draft to continue. Your saved secrets are still stored.
+continue-draft = Continue draft
+choose-people = Choose trusted people
+block-count = Blocks added
+selected-count = Selected
+file-prompt = Send a document up to 10 MB, with an optional caption. Use Back to choose another block type.
+no-confirmed-people = No confirmed trusted people yet. Open Trusted people, send an invitation, then confirm the person after they join. Return to My plan → Continue draft; your blocks are kept until the draft expires.
+add-block-first = Add at least one text or file block before choosing trusted people.
+select-person-first = Select at least one person to continue.
+selection-limit = You can select up to 10 people.
+timing-default = Use 7 / 28 / 7 days
+timing-custom = Set my own intervals
+timing-explained = Choose the timing. With 7 / 28 / 7, reminders arrive every 7 days; after 28 days without your confirmation, guardians are asked to review. Release waits another 7 days after their required confirmations.
+invalid-timing = These intervals are invalid. Use reminders of 1–30 days, inactivity of 2–365 days and waiting of 1–30 days. Inactivity must be at least twice the reminder interval. Try again, for example: 7 28 7.
+edit-blocks = Add more blocks
+edit-people = Change people and timing
+stale-action = This button belongs to an earlier step or has expired. Open the current draft or main menu to continue.
+invalid-code = The code was not accepted. Check the saved code and reply to the current code request.
+not-ready = This action is not ready yet. Save and acknowledge your recovery key, and check the plan status and pending code confirmations.
+quota-exceeded = This limit has been reached. A draft allows 20 blocks, 3 files, and 32 KB of text. Each file must be at most 10 MB; the plan allows 50 secrets and 250 MB of files.
+invalid-policy = These transfer conditions are not valid. Check the selected people, required confirmations and intervals.
+invalid-state = This action is unavailable in the current plan state. Open the plan status to choose the next step.
+last-checkin = Last activity confirmation
+cancel-secret = Request cancellation of this secret
+cancel-plan = Request cancellation of the whole plan
+cancellation-votes = Cancellation votes
+secret-reference = Secret reference
+delete-secret-confirm = Permanently delete this secret and its stored content? Other secrets remain in the plan. Copies already received by people cannot be recalled.
+help = Help
+help-text = Use My plan to invite trusted people, create a secret and check its status. Drafts support Back and Continue draft; they expire 15 minutes after the last added block, with a maximum lifetime of one hour. Save encrypts the content and ends your access to it.
+
+    /checkin confirms your activity and cancels pending release requests.
+    /stop stops new transmissions. Copies already received cannot be recalled.
+    /status shows your plan and saved secrets.
+    /guardians opens requests and delivery retries.
+    /settings changes language and opens recovery.
+    /start opens the main menu.
+
+    Use only synthetic test data in this build.
+owner-label = Owner (Telegram ID)

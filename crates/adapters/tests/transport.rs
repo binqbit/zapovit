@@ -5,6 +5,80 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 #[tokio::test]
+async fn guardian_prompt_opens_reply_ui_and_command_menu_is_localized() {
+    use axum::extract::{Path, State};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    type Requests = Arc<Mutex<Vec<(String, Value)>>>;
+    let requests: Requests = Default::default();
+    let app = Router::new()
+        .route(
+            "/bot1:test/{method}",
+            post(
+                |State(requests): State<Requests>,
+                 Path(method): Path<String>,
+                 Json(body): Json<Value>| async move {
+                    let result = if method == "setMyCommands" {
+                        json!(true)
+                    } else {
+                        json!({"message_id":42})
+                    };
+                    requests.lock().await.push((method, body));
+                    Json(json!({"ok":true,"result":result}))
+                },
+            ),
+        )
+        .with_state(requests.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let tg = Telegram::new(&format!("http://{addr}"), Zeroizing::new("1:test".into())).unwrap();
+    assert!(matches!(
+        tg.send_prompt(123, "Reply with your synthetic guardian code")
+            .await,
+        SendResult::Sent(42)
+    ));
+    tg.configure_commands().await.unwrap();
+    let requests = requests.lock().await;
+    let (method, body) = &requests[0];
+    assert_eq!(method, "sendMessage");
+    assert_eq!(body["chat_id"], 123);
+    assert_eq!(body["reply_markup"]["force_reply"], true);
+    assert!(body["reply_markup"].get("inline_keyboard").is_none());
+    assert!(body.get("protect_content").is_none());
+    for (index, language) in [(1, ""), (2, "uk")] {
+        let (method, body) = &requests[index];
+        assert_eq!(method, "setMyCommands");
+        assert_eq!(body["scope"]["type"], "all_private_chats");
+        assert_eq!(body["language_code"], language);
+        let commands = body["commands"].as_array().unwrap();
+        for command in [
+            "start",
+            "help",
+            "settings",
+            "checkin",
+            "stop",
+            "status",
+            "guardians",
+        ] {
+            assert!(commands.iter().any(|entry| entry["command"] == command));
+        }
+        assert!(commands.iter().all(|entry| {
+            entry["description"].as_str().is_some_and(|description| {
+                !description.is_empty()
+                    && description != "Message unavailable"
+                    && description.chars().count() <= 256
+            })
+        }));
+    }
+    assert_ne!(
+        requests[1].1["commands"][0]["description"],
+        requests[2].1["commands"][0]["description"]
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn telegram_preserves_copyable_text_and_file_saving() {
     use adapters::telegram::entity;
     use axum::{body::Bytes, extract::State};

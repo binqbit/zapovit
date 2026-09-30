@@ -148,6 +148,42 @@ impl Telegram {
                 .into(),
         ))
     }
+    /// Publish the commands exposed by the private-chat UI in both supported languages.
+    pub async fn configure_commands(&self) -> Result<()> {
+        for (language, locale) in [("", "en"), ("uk", "uk")] {
+            let commands: Vec<_> = [
+                ("start", "home"),
+                ("help", "help"),
+                ("status", "status"),
+                ("checkin", "checkin"),
+                ("stop", "stop"),
+                ("guardians", "guardians"),
+                ("settings", "settings"),
+            ]
+            .into_iter()
+            .map(|(command, label)| {
+                json!({"command":command,"description":crate::localization::tr(locale, label)})
+            })
+            .collect();
+            let response = self
+                .client
+                .post(self.url("setMyCommands"))
+                .timeout(Duration::from_secs(10))
+                .json(&json!({
+                    "scope":{"type":"all_private_chats"},
+                    "language_code":language,
+                    "commands":commands
+                }))
+                .send()
+                .await
+                .map_err(|_| Error::Storage)?;
+            let value = Self::bounded(response, 65536).await?;
+            if value["ok"] != true || value["result"] != true {
+                return Err(Error::MessageUnavailable);
+            }
+        }
+        Ok(())
+    }
     /// Caller persists the returned updates and cursor in one transaction before polling again.
     pub async fn poll(&self, offset: i64) -> Result<Vec<Value>> {
         let r=self.client.post(self.url("getUpdates")).json(&json!({"offset":offset,"timeout":30,"limit":100,"allowed_updates":["message","callback_query"]})).send().await.map_err(|_|Error::Storage)?;
@@ -219,6 +255,33 @@ impl Telegram {
         self.reserve_send(chat).await;
         self.send_text_reserved(chat, text, entities, buttons, reply_to)
             .await
+    }
+    /// Open Telegram's reply UI so a guardian's code stays bound to its request.
+    pub async fn send_prompt(&self, chat: i64, text: &str) -> SendResult {
+        if text.is_empty() || text.encode_utf16().count() > 4096 {
+            return SendResult::Permanent;
+        }
+        if let Some(seconds) = self.remaining_cooldown().await {
+            return SendResult::RetryAfter(seconds);
+        }
+        self.reserve_send(chat).await;
+        if let Some(seconds) = self.remaining_cooldown().await {
+            return SendResult::RetryAfter(seconds);
+        }
+        let response = self
+            .client
+            .post(self.url("sendMessage"))
+            .timeout(Duration::from_secs(15))
+            .json(&json!({
+                "chat_id":chat,"text":text,
+                "link_preview_options":{"is_disabled":true},
+                "reply_markup":{"force_reply":true}
+            }))
+            .send()
+            .await;
+        let result = Self::classify(response).await;
+        self.observe_retry(&result).await;
+        result
     }
     /// Update a non-secret navigation message and its inline buttons in place.
     pub async fn edit_menu(
