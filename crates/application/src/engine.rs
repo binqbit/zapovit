@@ -526,6 +526,7 @@ impl Engine {
             policy: None,
             saved_secret: None,
             sources: vec![],
+            cleanup_scheduled: vec![],
         };
         put(&mut *tx, Some(plan_id), &d).await?;
         tx.commit().await?;
@@ -575,13 +576,14 @@ impl Engine {
         }
         let mut tx = self.db.begin().await?;
         let (mut draft, _) = self.editable(&mut *tx, actor, id).await?;
-        self.append_to_draft(&mut *tx, &mut draft, block, source)
+        self.append_to_draft(&mut *tx, actor, &mut draft, block, source)
             .await?;
         tx.commit().await
     }
     async fn append_to_draft(
         &self,
         tx: &mut dyn Transaction,
+        actor: Id,
         draft: &mut Draft,
         block: Block,
         source: (i64, i64),
@@ -597,8 +599,26 @@ impl Engine {
         let bytes = Zeroizing::new(serde_json::to_vec(&blocks).map_err(|_| Error::Internal)?);
         draft.payload = self.crypto.wrap("draft", draft.id, &bytes)?;
         draft.revision += 1;
-        draft.expires_at = (tx.now().await? + 900).min(draft.created_at + 3600);
+        let now = tx.now().await?;
+        draft.expires_at = (now + 900).min(draft.created_at + 3600);
         draft.sources.push(source);
+        // Commit encrypted content and its cleanup obligation together. The file
+        // path reaches this point only after upload and lifecycle revalidation.
+        enqueue(
+            tx,
+            Some(draft.plan_id),
+            Task::CleanupMessage {
+                chat_id: source.0,
+                message_id: source.1,
+                sent_at: draft.created_at,
+                account_id: actor,
+            },
+            now,
+            now + DAY,
+            0,
+        )
+        .await?;
+        draft.cleanup_scheduled.push(source);
         put(tx, Some(draft.plan_id), draft).await?;
         Ok(true)
     }
@@ -695,7 +715,7 @@ impl Engine {
             return Err(RuleError::StaleAction.into());
         }
         if self
-            .append_to_draft(&mut *tx, &mut fresh, block, source)
+            .append_to_draft(&mut *tx, actor, &mut fresh, block, source)
             .await?
         {
             object.state = "draft".into();
@@ -894,6 +914,10 @@ impl Engine {
             put(&mut *tx, Some(plan.id), &object).await?;
         }
         for (chat_id, message_id) in &fresh.sources {
+            // Legacy drafts and preview messages still use seal-time cleanup.
+            if fresh.cleanup_scheduled.contains(&(*chat_id, *message_id)) {
+                continue;
+            }
             enqueue(
                 &mut *tx,
                 Some(plan.id),
@@ -905,13 +929,14 @@ impl Engine {
                 },
                 now,
                 now + DAY,
-                1,
+                0,
             )
             .await?;
         }
         fresh.payload = self.crypto.wrap("draft", draft_id, b"[]")?;
         fresh.saved_secret = Some(id);
         fresh.sources.clear();
+        fresh.cleanup_scheduled.clear();
         fresh.policy = None;
         put(&mut *tx, Some(plan.id), &fresh).await?;
         Self::record_receipt(

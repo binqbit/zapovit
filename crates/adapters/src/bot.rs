@@ -1069,33 +1069,12 @@ impl BotUi {
             Task::CleanupMessage {
                 chat_id,
                 message_id,
-                account_id,
                 ..
             } => {
                 let result = match self.telegram.delete(*chat_id, *message_id).await {
                     DeleteResult::Deleted => SendResult::Sent(0),
                     DeleteResult::RetryAfter(seconds) => SendResult::RetryAfter(seconds),
-                    DeleteResult::Permanent => {
-                        let mut tx = self.engine.db.begin().await?;
-                        let now = tx.now().await?;
-                        if tx.get(Kind::Account, *account_id).await?.is_some() {
-                            enqueue(
-                                &mut *tx,
-                                None,
-                                Task::Notice {
-                                    account_id: *account_id,
-                                    key: "manual-delete".into(),
-                                    buttons: vec![],
-                                },
-                                now,
-                                now + DAY,
-                                0,
-                            )
-                            .await?;
-                        }
-                        tx.commit().await?;
-                        SendResult::Permanent
-                    }
+                    DeleteResult::Permanent => SendResult::Permanent,
                 };
                 self.engine
                     .finish_job(job.id, job.lease_token, result)

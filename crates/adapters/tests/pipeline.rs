@@ -14,6 +14,9 @@ use zeroize::Zeroizing;
 #[path = "pipeline_cases/transport_validation.rs"]
 mod transport_validation;
 
+#[path = "pipeline_cases/source_cleanup.rs"]
+mod source_cleanup;
+
 #[path = "pipeline_cases/menu_navigation.rs"]
 mod menu_navigation;
 

@@ -16,6 +16,27 @@ fn part_aad(id: Id, secret: Id, recipient: Id) -> Vec<u8> {
     b
 }
 
+async fn manual_cleanup_notice(tx: &mut dyn Transaction, job: &Job, now: i64) -> Result<()> {
+    if let Task::CleanupMessage { account_id, .. } = &job.task
+        && tx.get(Kind::Account, *account_id).await?.is_some()
+    {
+        enqueue(
+            tx,
+            None,
+            Task::Notice {
+                account_id: *account_id,
+                key: "manual-delete".into(),
+                buttons: vec![],
+            },
+            now,
+            now + DAY,
+            0,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 impl Engine {
     pub async fn submit_code(&self, actor: Id, case_id: Id, code: &str) -> Result<()> {
         self.limit(&format!("code:{actor}:{case_id}"), 5, 900)
@@ -288,6 +309,9 @@ impl Engine {
                 job.task,
                 Task::CleanupMessage { .. } | Task::DeleteObject { .. }
             ) {
+                // Expiry must not silently leave private source messages behind.
+                // The notice and job removal commit together, including on retry.
+                manual_cleanup_notice(&mut *tx, &job, now).await?;
                 for attempt in list::<Attempt>(&mut *tx, Some(id)).await? {
                     tx.remove(Kind::Attempt, attempt.id).await?;
                 }
@@ -612,6 +636,9 @@ impl Engine {
             )
             && matches!(state, PartState::Sent | PartState::PermanentFailed)
         {
+            if state == PartState::PermanentFailed {
+                manual_cleanup_notice(&mut *tx, &job, now).await?;
+            }
             for attempt in list::<Attempt>(&mut *tx, Some(id)).await? {
                 tx.remove(Kind::Attempt, attempt.id).await?;
             }

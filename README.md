@@ -18,6 +18,8 @@ The owner decides what to pass on, who should receive it, and under which condit
 
 The Telegram interface guides preparation one step at a time: recovery key, confirmed people, roles and timing, content, review, code acknowledgments, then activation. Home shows readiness and deadlines. Private names, separate guardian/recipient views, draft editing and scoped pause/delete controls keep additional options in the relevant card.
 
+Each accepted text block or uploaded file queues removal of its original chat message as soon as its encrypted draft content is durably stored, before final sealing. Removal can be delayed or refused by Telegram; the bot asks for manual deletion when retries expire or deletion fails permanently.
+
 Missed activity confirmations start a review by trusted contacts. They do not, on their own, establish that the owner is unable to manage their data.
 
 ## Development

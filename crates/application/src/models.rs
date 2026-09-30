@@ -74,6 +74,9 @@ pub struct Draft {
     pub policy: Option<Policy>,
     pub saved_secret: Option<Id>,
     pub sources: Vec<(i64, i64)>,
+    /// Durable scheduling receipts remain after successful cleanup jobs are removed.
+    #[serde(default)]
+    pub cleanup_scheduled: Vec<(i64, i64)>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

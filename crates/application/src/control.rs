@@ -48,6 +48,9 @@ async fn remove_scope(tx: &mut dyn Transaction, kind: Kind, scope: Id) -> Result
 pub(crate) async fn remove_draft(tx: &mut dyn Transaction, draft: &Draft) -> Result<()> {
     let now = tx.now().await?;
     for (chat_id, message_id) in &draft.sources {
+        if draft.cleanup_scheduled.contains(&(*chat_id, *message_id)) {
+            continue;
+        }
         if let Some(account) = find::<Account>(tx, "chat_id", &chat_id.to_string())
             .await?
             .into_iter()
@@ -64,7 +67,7 @@ pub(crate) async fn remove_draft(tx: &mut dyn Transaction, draft: &Draft) -> Res
                 },
                 now,
                 now + DAY,
-                1,
+                0,
             )
             .await?;
         }
