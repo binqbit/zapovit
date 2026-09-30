@@ -614,10 +614,34 @@ async fn runtime_unverified_recovery_selector_cannot_hold_target_plan() {
         status(&f, plan).await.ready,
         "even quarantine of an unverified attempt has no target authority"
     );
-    sqlx::query("UPDATE rate_limits SET used=20 WHERE key='admission:recovery-routing'")
-        .execute(&f.db.pool)
-        .await
-        .unwrap();
+    let seeded = sqlx::query(
+        "UPDATE rate_limits SET used=20,window_start=0 WHERE key='admission:recovery-routing'",
+    )
+    .execute(&f.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(seeded.rows_affected(), 1);
+    // Pin this isolated fixture's exhausted-admission precondition even across a
+    // minute boundary. This test checks rejection/cleanup, not counter rollover.
+    sqlx::query(
+        "CREATE FUNCTION keep_test_recovery_budget_exhausted() RETURNS trigger
+         LANGUAGE plpgsql AS $$ BEGIN
+           NEW.used := GREATEST(NEW.used, OLD.used + 1);
+           RETURN NEW;
+         END $$",
+    )
+    .execute(&f.db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER keep_test_recovery_budget_exhausted
+         BEFORE UPDATE ON rate_limits FOR EACH ROW
+         WHEN (OLD.key='admission:recovery-routing' AND OLD.used>=20)
+         EXECUTE FUNCTION keep_test_recovery_budget_exhausted()",
+    )
+    .execute(&f.db.pool)
+    .await
+    .unwrap();
     let rejected = routed(&f, 92001, 9102, &invalid).await;
     assert!(rejected.route.admission_rejected);
     assert_eq!(
