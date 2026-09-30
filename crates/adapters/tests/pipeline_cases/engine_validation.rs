@@ -121,6 +121,23 @@ impl Transaction for GatedTx {
     async fn operational_ready(&mut self) -> Result<bool> {
         self.inner.operational_ready().await
     }
+    async fn operational_status(&mut self, plan: Option<Id>) -> Result<OperationalStatus> {
+        self.inner.operational_status(plan).await
+    }
+    async fn reserve_resource(
+        &mut self,
+        resource: &str,
+        id: Id,
+        amount: i64,
+        capacity: i64,
+    ) -> Result<bool> {
+        self.inner
+            .reserve_resource(resource, id, amount, capacity)
+            .await
+    }
+    async fn release_resource(&mut self, resource: &str, id: Id) -> Result<()> {
+        self.inner.release_resource(resource, id).await
+    }
     async fn writes_ready(&mut self) -> Result<bool> {
         self.inner.writes_ready().await
     }

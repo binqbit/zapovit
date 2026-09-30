@@ -3,7 +3,9 @@ use domain::{DAY, Id, PlanState, RuleError, SecretState};
 
 fn secret_target(control: &Control) -> Option<Id> {
     match control {
-        Control::StopSecret { secret_id } | Control::DeleteSecret { secret_id } => Some(*secret_id),
+        Control::StopSecret { secret_id }
+        | Control::RearmSecret { secret_id }
+        | Control::DeleteSecret { secret_id } => Some(*secret_id),
         _ => None,
     }
 }
@@ -27,15 +29,23 @@ async fn tombstone(
 }
 
 async fn remove_scope(tx: &mut dyn Transaction, kind: Kind, scope: Id) -> Result<()> {
-    for raw in tx.list(kind, Some(scope)).await? {
-        let id: Id = serde_json::from_value(raw.get("id").cloned().ok_or(Error::Internal)?)
-            .map_err(|_| Error::Internal)?;
-        tx.remove(kind, id).await?;
+    let mut after = None;
+    loop {
+        let records = tx.page(kind, Some(scope), after, 200).await?;
+        if records.is_empty() {
+            break;
+        }
+        for raw in records {
+            let id: Id = serde_json::from_value(raw.get("id").cloned().ok_or(Error::Internal)?)
+                .map_err(|_| Error::Internal)?;
+            after = Some(id);
+            tx.remove(kind, id).await?;
+        }
     }
     Ok(())
 }
 
-async fn remove_draft(tx: &mut dyn Transaction, draft: &Draft) -> Result<()> {
+pub(crate) async fn remove_draft(tx: &mut dyn Transaction, draft: &Draft) -> Result<()> {
     let now = tx.now().await?;
     for (chat_id, message_id) in &draft.sources {
         if let Some(account) = find::<Account>(tx, "chat_id", &chat_id.to_string())
@@ -59,17 +69,32 @@ async fn remove_draft(tx: &mut dyn Transaction, draft: &Draft) -> Result<()> {
             .await?;
         }
     }
-    for mut object in list::<FileObject>(tx, Some(draft.plan_id)).await? {
+    for mut object in find::<FileObject>(tx, "draft_id", &draft.id.to_string()).await? {
         if object.draft_id == draft.id && matches!(object.state.as_str(), "draft" | "pending") {
             object.state = "gc".into();
             object.due_at = now;
             put(tx, Some(draft.plan_id), &object).await?;
         }
     }
-    for job in list::<Job>(tx, Some(draft.plan_id)).await? {
-        if matches!(job.task, Task::DownloadFile { draft_id, .. } if draft_id == draft.id) {
-            remove_scope(tx, Kind::Attempt, job.id).await?;
-            tx.remove(Kind::Job, job.id).await?;
+    let mut after = None;
+    loop {
+        let records = tx.page(Kind::Job, Some(draft.plan_id), after, 200).await?;
+        if records.is_empty() {
+            break;
+        }
+        for raw in records {
+            let job: Job = serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+            after = Some(job.id);
+            if matches!(job.task, Task::DownloadFile { draft_id, .. } if draft_id == draft.id) {
+                remove_scope(tx, Kind::Attempt, job.id).await?;
+                tx.remove(Kind::Job, job.id).await?;
+            }
+        }
+    }
+    tx.remove(Kind::PrivateMetadata, draft.id).await?;
+    for session in list::<DraftSession>(tx, Some(draft.plan_id)).await? {
+        if session.dialog.draft_id == Some(draft.id) {
+            tx.remove(Kind::DraftSession, session.id).await?;
         }
     }
     tx.remove(Kind::Draft, draft.id).await
@@ -104,6 +129,7 @@ async fn purge_plan_content(
             tx.remove(Kind::DeliveryPart, part.id).await?;
         }
         tx.remove(Kind::Secret, secret.id).await?;
+        tx.remove(Kind::PrivateMetadata, secret.id).await?;
         tombstone(tx, secret.id, DeletedScope::Secret, intent.id).await?;
     }
     // A pre-Save snapshot can contain a readable draft while the newer journal only
@@ -196,6 +222,10 @@ async fn purge_plan_content(
         }
     }
     if only_secret.is_none() {
+        remove_scope(tx, Kind::PrivateMetadata, plan_id).await?;
+        remove_scope(tx, Kind::ContactState, plan_id).await?;
+        remove_scope(tx, Kind::InvitationState, plan_id).await?;
+        remove_scope(tx, Kind::DraftSession, plan_id).await?;
         remove_scope(tx, Kind::Participant, plan_id).await?;
         remove_scope(tx, Kind::Invitation, plan_id).await?;
         tx.remove(Kind::Plan, plan_id).await?;
@@ -214,15 +244,56 @@ impl Engine {
         }
         let mut tx = self.db.begin().await?;
         let (profile, plan) = Self::owner(&mut *tx, actor, plan_id).await?;
-        if matches!(operation, Control::Rearm)
+        if let Some(raw) = tx.get(Kind::ControlIntent, id).await? {
+            let existing: ControlIntent =
+                serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+            if existing.plan_id != plan_id
+                || serde_json::to_value(&existing.operation).map_err(|_| Error::Internal)?
+                    != serde_json::to_value(&operation).map_err(|_| Error::Internal)?
+            {
+                return Err(RuleError::AccessDenied.into());
+            }
+            tx.commit().await?;
+            if !existing.applied {
+                self.journal.append(&existing).await?;
+                self.apply_control(&existing, false).await?;
+            }
+            return Ok(());
+        }
+        if matches!(operation, Control::Rearm | Control::RearmSecret { .. })
             && plan.pending_control.is_some_and(|pending| pending != id)
         {
             return Err(RuleError::NotReady.into());
         }
-        if matches!(operation, Control::Rearm)
+        if matches!(operation, Control::Rearm | Control::RearmSecret { .. })
             && (profile.pending_claim.is_some() || !profile.recovery_saved)
         {
             return Err(RuleError::NotReady.into());
+        }
+        if matches!(operation, Control::Rearm)
+            && !list::<Secret>(&mut *tx, Some(plan.id))
+                .await?
+                .iter()
+                .any(|s| {
+                    matches!(
+                        s.state,
+                        SecretState::Armed | SecretState::Partial | SecretState::NeedsAttention
+                    )
+                })
+        {
+            return Err(RuleError::NotReady.into());
+        }
+        if let Control::RearmSecret { secret_id } = operation {
+            let secret: Secret = get(&mut *tx, secret_id).await?;
+            let grants = list::<GuardianGrant>(&mut *tx, Some(secret_id)).await?;
+            if secret.plan_id != plan.id
+                || secret.state != SecretState::Paused
+                || secret.pending_control.is_some()
+                || grants.len() != secret.policy.guardians.len()
+                || grants.iter().any(|g| !g.ready)
+            {
+                return Err(RuleError::NotReady.into());
+            }
         }
         let intent = self
             .stage_control(&mut *tx, profile, plan, id, operation)
@@ -242,7 +313,10 @@ impl Engine {
         if let Some(raw) = tx.get(Kind::ControlIntent, id).await? {
             let mut existing: ControlIntent =
                 serde_json::from_value(raw).map_err(|_| Error::Internal)?;
-            if existing.plan_id != plan.id {
+            if existing.plan_id != plan.id
+                || serde_json::to_value(&existing.operation).map_err(|_| Error::Internal)?
+                    != serde_json::to_value(&operation).map_err(|_| Error::Internal)?
+            {
                 return Err(RuleError::AccessDenied.into());
             }
             existing.applied = false;
@@ -255,9 +329,15 @@ impl Engine {
             if s.plan_id != plan.id || s.state == SecretState::Deleted {
                 return Err(RuleError::AccessDenied.into());
             }
+            if matches!(operation, Control::RearmSecret { .. }) && s.state == SecretState::Delivered
+            {
+                return Err(RuleError::InvalidState.into());
+            }
             s.epoch += 1;
             s.pending_control = Some(id);
-            s.state = SecretState::Paused;
+            if s.state != SecretState::Delivered {
+                s.state = SecretState::Paused;
+            }
             put(tx, Some(plan.id), &s).await?;
             Some(s.epoch)
         } else {
@@ -288,50 +368,69 @@ impl Engine {
         for intent in &entries {
             self.apply_control(intent, true).await?;
         }
-        let mut tx = self.db.begin().await?;
-        let pending = list::<ControlIntent>(&mut *tx, None).await?;
-        tx.commit().await?;
-        for intent in pending.into_iter().filter(|i| !i.applied) {
-            self.journal.append(&intent).await?;
-            self.apply_control(&intent, false).await?;
+        let mut after = None;
+        loop {
+            let mut tx = self.db.begin().await?;
+            let page = tx.page(Kind::ControlIntent, None, after, 200).await?;
+            tx.commit().await?;
+            if page.is_empty() {
+                break;
+            }
+            for raw in page {
+                let intent: ControlIntent =
+                    serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+                after = Some(intent.id);
+                if !intent.applied {
+                    self.journal.append(&intent).await?;
+                    self.apply_control(&intent, false).await?;
+                }
+            }
         }
         self.discard_unfinished_drafts().await
     }
 
     async fn discard_unfinished_drafts(&self) -> Result<()> {
-        let mut tx = self.db.begin().await?;
-        let plans = list::<Plan>(&mut *tx, None).await?;
-        tx.commit().await?;
-        for plan in plans {
+        let mut after = None;
+        loop {
             let mut tx = self.db.begin().await?;
-            tx.lock(Kind::Plan, plan.id).await?;
-            if tx.get(Kind::Plan, plan.id).await?.is_none() {
-                continue;
-            }
-            let now = tx.now().await?;
-            let mut discarded = std::collections::BTreeSet::new();
-            for draft in list::<Draft>(&mut *tx, Some(plan.id)).await? {
-                if draft.saved_secret.is_none() {
-                    discarded.insert(draft.id);
-                    remove_draft(&mut *tx, &draft).await?;
-                }
-            }
-            if discarded.is_empty() {
-                continue;
-            }
-            for action in list::<Action>(&mut *tx, Some(plan.id)).await? {
-                if action.target.is_some_and(|id| discarded.contains(&id)) {
-                    tx.remove(Kind::Action, action.id).await?;
-                }
-            }
-            for dialog in list::<Dialog>(&mut *tx, Some(plan.id)).await? {
-                if dialog.draft_id.is_some_and(|id| discarded.contains(&id)) {
-                    tx.remove(Kind::Dialog, dialog.id).await?;
-                }
-            }
-            let profile: Profile = get(&mut *tx, plan.profile_id).await?;
-            notice(&mut *tx, plan.id, profile.owner_id, "draft-reset", now).await?;
+            let page = tx.page(Kind::Plan, None, after, 200).await?;
             tx.commit().await?;
+            if page.is_empty() {
+                break;
+            }
+            for raw in page {
+                let plan: Plan = serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+                after = Some(plan.id);
+                let mut tx = self.db.begin().await?;
+                tx.lock(Kind::Plan, plan.id).await?;
+                if tx.get(Kind::Plan, plan.id).await?.is_none() {
+                    continue;
+                }
+                let now = tx.now().await?;
+                let mut discarded = std::collections::BTreeSet::new();
+                for draft in list::<Draft>(&mut *tx, Some(plan.id)).await? {
+                    if draft.saved_secret.is_none() {
+                        discarded.insert(draft.id);
+                        remove_draft(&mut *tx, &draft).await?;
+                    }
+                }
+                if discarded.is_empty() {
+                    continue;
+                }
+                for action in list::<Action>(&mut *tx, Some(plan.id)).await? {
+                    if action.target.is_some_and(|id| discarded.contains(&id)) {
+                        tx.remove(Kind::Action, action.id).await?;
+                    }
+                }
+                for dialog in list::<Dialog>(&mut *tx, Some(plan.id)).await? {
+                    if dialog.draft_id.is_some_and(|id| discarded.contains(&id)) {
+                        tx.remove(Kind::Dialog, dialog.id).await?;
+                    }
+                }
+                let profile: Profile = get(&mut *tx, plan.profile_id).await?;
+                notice(&mut *tx, plan.id, profile.owner_id, "draft-reset", now).await?;
+                tx.commit().await?;
+            }
         }
         Ok(())
     }
@@ -368,6 +467,12 @@ impl Engine {
                                 selector,
                                 verifier,
                             } => {
+                                tx.admit_recovery_account(
+                                    target,
+                                    profile.id,
+                                    profile.recovery_selector,
+                                )
+                                .await?;
                                 profile.owner_id = target.id;
                                 profile.owner_epoch = intent.owner_epoch + 1;
                                 profile.recovery_selector = *selector;
@@ -431,6 +536,19 @@ impl Engine {
             secret.pending_control = None;
             secret.state = if matches!(intent.operation, Control::DeleteSecret { .. }) {
                 SecretState::Deleted
+            } else if matches!(intent.operation, Control::RearmSecret { .. }) {
+                let grants = list::<GuardianGrant>(&mut *tx, Some(id)).await?;
+                if profile.recovery_saved
+                    && profile.pending_claim.is_none()
+                    && grants.len() == secret.policy.guardians.len()
+                    && grants.iter().all(|g| g.ready)
+                {
+                    SecretState::Armed
+                } else {
+                    SecretState::Paused
+                }
+            } else if secret.state == SecretState::Delivered {
+                SecretState::Delivered
             } else {
                 SecretState::Paused
             };
@@ -452,7 +570,19 @@ impl Engine {
                     };
                 }
                 Control::Rearm => {
-                    if profile.pending_claim.is_some() || !profile.recovery_saved {
+                    let ready_secret =
+                        list::<Secret>(&mut *tx, Some(plan.id))
+                            .await?
+                            .iter()
+                            .any(|secret| {
+                                matches!(
+                                    secret.state,
+                                    SecretState::Armed
+                                        | SecretState::Partial
+                                        | SecretState::NeedsAttention
+                                )
+                            });
+                    if profile.pending_claim.is_some() || !profile.recovery_saved || !ready_secret {
                         if !replay {
                             return Err(RuleError::NotReady.into());
                         }
@@ -495,6 +625,8 @@ impl Engine {
                     selector,
                     verifier,
                 } => {
+                    tx.admit_recovery_account(target, profile.id, profile.recovery_selector)
+                        .await?;
                     plan.state = PlanState::Paused;
                     profile.owner_id = target.id;
                     profile.owner_epoch = intent.owner_epoch + 1;
@@ -516,6 +648,7 @@ impl Engine {
         );
         let delete_one = matches!(intent.operation, Control::DeleteSecret { .. });
         if delete_all || delete_one {
+            Self::control_receipt(&mut *tx, intent, profile.owner_id).await?;
             purge_plan_content(&mut *tx, plan.id, secret_id, intent).await?;
             if delete_all {
                 remove_scope(&mut *tx, Kind::Claim, profile.id).await?;
@@ -550,7 +683,9 @@ impl Engine {
             .into_iter()
             .filter(|s| secret_id.is_none_or(|id| s.id == id))
         {
-            for mut case in list::<CaseRecord>(&mut *tx, Some(secret.id)).await? {
+            for raw in tx.active_cases(secret.id).await? {
+                let mut case: CaseRecord =
+                    serde_json::from_value(raw).map_err(|_| Error::Internal)?;
                 case.case.cancel();
                 case.due_at = i64::MAX;
                 put(&mut *tx, Some(secret.id), &case).await?;
@@ -572,14 +707,10 @@ impl Engine {
             {
                 secret.state = SecretState::Armed;
                 secret.due_at = plan.last_activity + secret.policy.timing.inactivity_seconds;
-            } else if matches!(intent.operation, Control::Rearm)
-                && secret.state == SecretState::Paused
+            } else if matches!(intent.operation, Control::RearmSecret { .. })
+                && secret.state == SecretState::Armed
             {
-                let grants = list::<GuardianGrant>(&mut *tx, Some(secret.id)).await?;
-                if grants.len() == secret.policy.guardians.len() && grants.iter().all(|g| g.ready) {
-                    secret.state = SecretState::Armed;
-                    secret.due_at = plan.last_activity + secret.policy.timing.inactivity_seconds;
-                }
+                secret.due_at = intent.at + secret.policy.timing.inactivity_seconds;
             }
             put(&mut *tx, Some(plan.id), &secret).await?;
         }
@@ -606,6 +737,7 @@ impl Engine {
             }
         }
         if matches!(intent.operation, Control::RecoveryComplete { .. }) {
+            remove_scope(&mut *tx, Kind::DraftSession, plan.id).await?;
             for draft in list::<Draft>(&mut *tx, Some(plan.id)).await? {
                 remove_draft(&mut *tx, &draft).await?;
             }
@@ -619,6 +751,7 @@ impl Engine {
         let mut done = intent.clone();
         done.applied = true;
         put(&mut *tx, Some(plan.id), &done).await?;
+        Self::control_receipt(&mut *tx, intent, profile.owner_id).await?;
         tx.commit().await
     }
     pub async fn recover(
@@ -638,6 +771,8 @@ impl Engine {
             .ok_or(Error::InvalidCode)?;
         let target: Account = get(&mut *tx, actor).await?;
         tx.commit().await?;
+        // Reserve expensive work only after cheap selector and actor validation.
+        self.limit("admission:argon-recovery", 120, 60).await?;
         if !self
             .recovery
             .verify(token, selector, &profile.recovery_hash)
@@ -645,6 +780,32 @@ impl Engine {
         {
             return Err(Error::InvalidCode);
         }
+        let mut tx = self.db.begin().await?;
+        if let Some(raw) = tx.get(Kind::ControlIntent, operation_id).await? {
+            let existing: ControlIntent =
+                serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+            if existing.profile_id != profile.id {
+                return Err(RuleError::AccessDenied.into());
+            }
+            let claim_id = match existing.operation {
+                Control::Stop if stop_only => None,
+                Control::RecoveryBegin { claim_id } if !stop_only => {
+                    let claim: Claim = get(&mut *tx, claim_id).await?;
+                    if claim.target.id != actor {
+                        return Err(RuleError::AccessDenied.into());
+                    }
+                    Some(claim_id)
+                }
+                _ => return Err(RuleError::AccessDenied.into()),
+            };
+            tx.commit().await?;
+            if !existing.applied {
+                self.journal.append(&existing).await?;
+                self.apply_control(&existing, false).await?;
+            }
+            return Ok(claim_id);
+        }
+        tx.commit().await?;
         let issued = if stop_only {
             None
         } else {
@@ -782,6 +943,20 @@ impl Engine {
     }
     pub async fn acknowledge_claim(&self, actor: Id, id: Id, operation_id: Id) -> Result<()> {
         let mut tx = self.db.begin().await?;
+        if let Some(raw) = tx.get(Kind::ControlIntent, operation_id).await? {
+            let existing: ControlIntent =
+                serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+            if !matches!(&existing.operation, Control::RecoveryComplete { target, .. } if target.id == actor)
+            {
+                return Err(RuleError::AccessDenied.into());
+            }
+            tx.commit().await?;
+            if !existing.applied {
+                self.journal.append(&existing).await?;
+                self.apply_control(&existing, false).await?;
+            }
+            return Ok(());
+        }
         let claim: Claim = get(&mut *tx, id).await?;
         let plan = list::<Plan>(&mut *tx, Some(claim.profile_id))
             .await?
@@ -827,8 +1002,32 @@ impl Engine {
         tx.commit().await
     }
     pub async fn rotate_recovery(&self, actor: Id, plan_id: Id, operation_id: Id) -> Result<Id> {
+        let mut tx = self.db.begin().await?;
+        Self::owner(&mut *tx, actor, plan_id).await?;
+        if let Some(raw) = tx.get(Kind::ControlIntent, operation_id).await? {
+            let existing: ControlIntent =
+                serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+            if existing.plan_id != plan_id {
+                return Err(RuleError::AccessDenied.into());
+            }
+            let Control::RecoveryBegin { claim_id } = existing.operation else {
+                return Err(RuleError::AccessDenied.into());
+            };
+            let claim: Claim = get(&mut *tx, claim_id).await?;
+            if claim.target.id != actor || !claim.rotation {
+                return Err(RuleError::AccessDenied.into());
+            }
+            tx.commit().await?;
+            if !existing.applied {
+                self.journal.append(&existing).await?;
+                self.apply_control(&existing, false).await?;
+            }
+            return Ok(claim_id);
+        }
+        tx.commit().await?;
         self.limit(&format!("recovery-rotate:{actor}"), 5, 3600)
             .await?;
+        self.limit("admission:argon-recovery", 120, 60).await?;
         let (selector, token, hash) = self.recovery.issue().await?;
         let mut tx = self.db.begin().await?;
         let (profile, plan) = Self::owner(&mut *tx, actor, plan_id).await?;

@@ -2,7 +2,7 @@ use adapters::{
     bot::BotUi,
     crypto::{ArgonHasher, CryptoAdapter},
     journal::FileJournal,
-    postgres::PgDatabase,
+    postgres::{PgDatabase, RoutedUpdate},
     settings::{Settings, StorageCredentials, keyring, read_env_secret},
     storage::S3Storage,
     telegram::Telegram,
@@ -43,6 +43,36 @@ enum Command {
     Maintenance {
         #[arg(long)]
         enabled: bool,
+    },
+    BackupBegin,
+    BackupDrain {
+        #[arg(long)]
+        session: Id,
+        #[arg(long, default_value_t = 180)]
+        timeout_seconds: u64,
+    },
+    BackupSnapshot {
+        #[arg(long)]
+        session: Id,
+        #[arg(long)]
+        directory: PathBuf,
+    },
+    BackupComplete {
+        #[arg(long)]
+        session: Id,
+    },
+    RestoreRequire,
+    RestoreVerify {
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        witness: PathBuf,
+    },
+    InboxRetry {
+        #[arg(long)]
+        bot: i64,
+        #[arg(long)]
+        update: i64,
     },
     ExportObjects {
         #[arg(long)]
@@ -98,6 +128,39 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Maintenance { enabled } => {
             adapters::backup::maintenance(&Settings::load()?, enabled).await
+        }
+        Command::BackupBegin => {
+            println!(
+                "{}",
+                adapters::backup::begin_backup(&Settings::load()?).await?
+            );
+            Ok(())
+        }
+        Command::BackupDrain {
+            session,
+            timeout_seconds,
+        } => {
+            adapters::backup::wait_for_drain(
+                &Settings::load()?,
+                session,
+                Duration::from_secs(timeout_seconds),
+            )
+            .await
+        }
+        Command::BackupSnapshot { session, directory } => {
+            adapters::backup::snapshot_journal(&Settings::load()?, session, &directory).await
+        }
+        Command::BackupComplete { session } => {
+            adapters::backup::complete_backup(&Settings::load()?, session).await
+        }
+        Command::RestoreRequire => adapters::backup::require_restore(&Settings::load()?).await,
+        Command::RestoreVerify { directory, witness } => {
+            adapters::backup::verify_restore(&Settings::load()?, &directory, &witness).await
+        }
+        Command::InboxRetry { bot, update } => {
+            let settings = Settings::load()?;
+            let db = PgDatabase::connect(&settings.database_url, settings.database_pool).await?;
+            db.retry_quarantined_update(bot, update).await
         }
         Command::ExportObjects { directory } => {
             adapters::backup::export_objects(&Settings::load()?, &directory).await
@@ -196,7 +259,12 @@ async fn serve(settings: Settings) -> Result<()> {
     let allow_initialize = startup("journal_bootstrap", db.journal_bootstrap_allowed().await)?;
     let journal = Arc::new(startup(
         "journal_open",
-        FileJournal::open_or_initialize(settings.journal_dir, journal_crypto, allow_initialize),
+        FileJournal::open_with_replica(
+            settings.journal_dir,
+            settings.journal_replica_dir,
+            journal_crypto,
+            allow_initialize,
+        ),
     )?);
     let engine = Engine {
         db: db.clone(),
@@ -222,6 +290,7 @@ async fn serve(settings: Settings) -> Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     let mut tasks = JoinSet::<Result<()>>::new();
     let health_ready = ready.clone();
+    let health_db = db.clone();
     let metrics_db = db.clone();
     let router = axum::Router::new()
         .route("/live", axum::routing::get(|| async { "ok" }))
@@ -229,8 +298,9 @@ async fn serve(settings: Settings) -> Result<()> {
             "/ready",
             axum::routing::get(move || {
                 let ready = health_ready.clone();
+                let db = health_db.clone();
                 async move {
-                    if ready.load(Ordering::Acquire) {
+                    if ready.load(Ordering::Acquire) && db.runtime_ready().await.unwrap_or(false) {
                         axum::http::StatusCode::OK
                     } else {
                         axum::http::StatusCode::SERVICE_UNAVAILABLE
@@ -269,6 +339,7 @@ async fn serve(settings: Settings) -> Result<()> {
         invalidate_old_cases(&engine).await?;
     }
     let poll_db = db.clone();
+    let poll_engine = engine.clone();
     let poll_stop = stopping.clone();
     let leader_stop = stopping.clone();
     tasks.spawn(supervise_leader(leader, leader_stop));
@@ -279,40 +350,52 @@ async fn serve(settings: Settings) -> Result<()> {
                 Ok(updates) => {
                     let mut encrypted = Vec::new();
                     for update in updates {
-                        let id = update["update_id"].as_i64().ok_or(Error::InvalidInput)?;
+                        let Some(id) = update["update_id"].as_i64().filter(|id| *id >= 0) else {
+                            tracing::warn!(event = "unsupported_telegram_update");
+                            continue;
+                        };
                         let context = Id::from_u128(((bot_id as u128) << 64) | id as u64 as u128);
                         let bytes = Zeroizing::new(
                             serde_json::to_vec(&update).map_err(|_| Error::Internal)?,
                         );
-                        let command = update["message"]["text"]
-                            .as_str()
-                            .unwrap_or("")
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("")
-                            .split('@')
-                            .next()
-                            .unwrap_or("");
-                        let mut priority = false;
-                        if matches!(command, "/stop" | "/checkin")
-                            && let Some(actor) = update["message"]["from"]["id"].as_i64()
-                        {
-                            priority = poll_db.priority_owner(actor).await?;
-                        }
-                        if let Some(id) = update["callback_query"]["data"]
-                            .as_str()
-                            .and_then(|id| Id::parse_str(id).ok())
-                            && let Some(actor) = update["callback_query"]["from"]["id"].as_i64()
-                        {
-                            priority |= poll_db.priority_callback(id, actor).await?;
-                        }
-                        encrypted.push((
-                            id,
-                            crypto.wrap("telegram-inbox", context, &bytes)?,
-                            priority,
-                        ));
+                        let mut route = poll_db.route_update(&update).await?;
+                        poll_db
+                            .authenticate_recovery_route(&update, &mut route, &poll_engine)
+                            .await?;
+                        encrypted.push(RoutedUpdate {
+                            update_id: id,
+                            envelope: crypto.wrap("telegram-inbox", context, &bytes)?,
+                            route,
+                        });
                     }
-                    poll_db.ingest_prioritized(bot_id, &encrypted).await?;
+                    let mut first_attempt = true;
+                    loop {
+                        let outcome = if first_attempt {
+                            poll_db.ingest_routed(bot_id, &encrypted).await?
+                        } else {
+                            poll_db.retry_ingest_routed(bot_id, &encrypted).await?
+                        };
+                        first_attempt = false;
+                        encrypted.drain(..outcome.consumed);
+                        if !outcome.rejected.is_empty() {
+                            tracing::warn!(
+                                event = "inbox_admission_rejected",
+                                count = outcome.rejected.len()
+                            );
+                            if let Err(error) =
+                                queue_busy_feedback(&poll_db, &outcome.rejected).await
+                            {
+                                tracing::warn!(event="busy_feedback_unavailable",code=%error);
+                            }
+                        }
+                        if encrypted.is_empty() || poll_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        // Retain only this bounded encrypted Telegram batch. Its
+                        // verified proof is rechecked for selector/authority by
+                        // admission, without spending another Argon rate token.
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
                 }
                 Err(_) => {
                     tracing::warn!(event = "telegram_poll_failed");
@@ -322,28 +405,36 @@ async fn serve(settings: Settings) -> Result<()> {
         }
         Ok(())
     });
-    for priority in [true, false] {
+    // Independent ordinary lanes can progress while one menu waits on Telegram.
+    // Protective traffic has its own worker and can preempt queued ordinary work.
+    for priority in [true, false, false] {
         let inbox_db = db.clone();
         let inbox_ui = ui.clone();
         let inbox_stop = stopping.clone();
         tasks.spawn(async move {
             while !inbox_stop.load(Ordering::Acquire) {
-                let updates = inbox_db
-                    .pending_updates_class(bot_id, Some(priority))
-                    .await?;
-                for (id, envelope) in updates {
-                    let context = Id::from_u128(((bot_id as u128) << 64) | id as u64 as u128);
-                    let bytes =
-                        inbox_ui
-                            .engine
-                            .crypto
-                            .unwrap("telegram-inbox", context, &envelope)?;
-                    let update = serde_json::from_slice(&bytes).map_err(|_| Error::Crypto)?;
-                    match inbox_ui.handle(bot_id, &update).await {
-                        Ok(()) => inbox_db.complete_update(bot_id, id).await?,
-                        Err(e) => {
-                            tracing::warn!(event="inbox_processing_failed",code=%e);
-                            break;
+                if let Some(claim) = inbox_db.claim_update(bot_id, priority).await? {
+                    let context =
+                        Id::from_u128(((bot_id as u128) << 64) | claim.update_id as u64 as u128);
+                    let result = async {
+                        let bytes = inbox_ui.engine.crypto.unwrap(
+                            "telegram-inbox",
+                            context,
+                            &claim.envelope,
+                        )?;
+                        let update = serde_json::from_slice(&bytes).map_err(|_| Error::Crypto)?;
+                        inbox_ui.handle(bot_id, &update).await
+                    };
+                    let result = tokio::time::timeout(Duration::from_secs(60), result)
+                        .await
+                        .unwrap_or(Err(Error::Storage));
+                    match result {
+                        Ok(()) => {
+                            inbox_db.finish_update(bot_id, &claim).await?;
+                        }
+                        Err(error) => {
+                            tracing::warn!(event="inbox_processing_failed",code=%error);
+                            inbox_db.fail_update(bot_id, &claim, &error).await?;
                         }
                     }
                 }
@@ -360,15 +451,32 @@ async fn serve(settings: Settings) -> Result<()> {
         while !scheduler_stop.load(Ordering::Acquire) {
             let result = schedule(&scheduler_db, &scheduler_engine).await;
             scheduler_ready.store(
-                result.is_ok()
-                    && scheduler_db.healthy_polling().await.unwrap_or(false)
-                    && !scheduler_db.has_backlog().await.unwrap_or(true),
+                result.is_ok() && scheduler_db.runtime_ready().await.unwrap_or(false),
                 Ordering::Release,
             );
             if let Err(e) = result {
                 tracing::warn!(event="scheduler_failed",code=%e);
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        Ok(())
+    });
+    let gc_engine = engine.clone();
+    let gc_stop = stopping.clone();
+    tasks.spawn(async move {
+        while !gc_stop.load(Ordering::Acquire) {
+            let mut tx = gc_engine.db.begin().await?;
+            let now = tx.now().await?;
+            let objects = tx.due(Kind::FileObject, now, 10).await?;
+            tx.commit().await?;
+            for raw in objects {
+                let object: FileObject =
+                    serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+                if let Err(error) = gc_engine.garbage_collect(object.id).await {
+                    tracing::warn!(event="object_cleanup_failed",code=%error);
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
         Ok(())
     });
@@ -415,6 +523,45 @@ async fn serve(settings: Settings) -> Result<()> {
     db.pool.close().await;
     Ok(())
 }
+/// Feedback uses reserved priority capacity but a much tighter global budget;
+/// it never registers unknown senders or delays durable protective ingestion.
+async fn queue_busy_feedback(db: &PgDatabase, actors: &[Id]) -> Result<()> {
+    use application::{Database, Task, enqueue};
+    for actor in actors {
+        let mut tx = db.begin().await?;
+        if tx.get(Kind::Account, *actor).await?.is_none() {
+            continue;
+        }
+        if !tx.rate_limit("feedback:overload:global", 20, 60).await? {
+            tx.commit().await?;
+            break;
+        }
+        if !tx
+            .rate_limit(&format!("feedback:overload:{actor}"), 1, 60)
+            .await?
+        {
+            tx.commit().await?;
+            continue;
+        }
+        let now = tx.now().await?;
+        enqueue(
+            &mut *tx,
+            None,
+            Task::Notice {
+                account_id: *actor,
+                key: "service-busy".into(),
+                buttons: vec![],
+            },
+            now,
+            now + 60,
+            0,
+        )
+        .await?;
+        tx.commit().await?;
+    }
+    Ok(())
+}
+
 async fn schedule(db: &PgDatabase, engine: &Engine) -> Result<()> {
     let gap = db.scheduler_heartbeat().await?;
     if gap > 120 {
@@ -423,73 +570,91 @@ async fn schedule(db: &PgDatabase, engine: &Engine) -> Result<()> {
     if gap > DAY {
         invalidate_old_cases(engine).await?;
     }
-    let mut tx = engine.db.begin().await?;
-    let plans = list::<Plan>(&mut *tx, None).await?;
-    tx.commit().await?;
-    for plan in plans {
-        engine.cleanup_plan(plan.id).await?;
-        engine.tick_plan(plan.id).await?;
+    for plan_id in db.due_plans().await? {
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            engine.cleanup_plan(plan_id).await?;
+            engine.tick_plan(plan_id).await
+        })
+        .await
+        .unwrap_or(Err(Error::Storage));
+        if let Err(error) = &result {
+            tracing::warn!(event="plan_schedule_failed",plan=%plan_id,code=%error);
+        }
+        db.plan_scheduled(plan_id, result.as_ref().err()).await?;
+        // One slow plan cannot make continued scheduler progress look like a
+        // global outage. Each per-plan attempt is independently bounded at15s.
+        db.scheduler_heartbeat().await?;
     }
-    let mut tx = engine.db.begin().await?;
-    let now = tx.now().await?;
-    let objects = tx.due(Kind::FileObject, now, 100).await?;
-    tx.commit().await?;
-    for raw in objects {
-        let object: FileObject = serde_json::from_value(raw).map_err(|_| Error::Internal)?;
-        engine.garbage_collect(object.id).await?;
-    }
+    db.retain_runtime_history().await?;
     Ok(())
 }
 async fn invalidate_old_cases(engine: &Engine) -> Result<()> {
-    let mut tx = engine.db.begin().await?;
-    let plans = list::<Plan>(&mut *tx, None).await?;
-    tx.commit().await?;
-    for p in plans {
+    let mut after = None;
+    loop {
         let mut tx = engine.db.begin().await?;
-        tx.lock(Kind::Plan, p.id).await?;
-        let now = tx.now().await?;
-        for mut s in list::<application::Secret>(&mut *tx, Some(p.id)).await? {
-            if let Some(id) = s.last_case {
-                let mut c: application::CaseRecord = get(&mut *tx, id).await?;
-                if c.case.state != CaseState::Complete {
-                    c.case.cancel();
-                    c.due_at = i64::MAX;
-                    put(&mut *tx, Some(s.id), &c).await?;
-                    for sub in list::<application::Submission>(&mut *tx, Some(id)).await? {
-                        tx.remove(Kind::Submission, sub.id).await?;
+        let plans = tx.page(Kind::Plan, None, after, 100).await?;
+        tx.commit().await?;
+        if plans.is_empty() {
+            break;
+        }
+        for raw in plans {
+            let p: Plan = serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+            after = Some(p.id);
+            let mut tx = engine.db.begin().await?;
+            tx.lock(Kind::Plan, p.id).await?;
+            let now = tx.now().await?;
+            for mut s in list::<application::Secret>(&mut *tx, Some(p.id)).await? {
+                if let Some(id) = s.last_case {
+                    let mut c: application::CaseRecord = get(&mut *tx, id).await?;
+                    if c.case.state != CaseState::Complete {
+                        c.case.cancel();
+                        c.due_at = i64::MAX;
+                        put(&mut *tx, Some(s.id), &c).await?;
+                        for sub in list::<application::Submission>(&mut *tx, Some(id)).await? {
+                            tx.remove(Kind::Submission, sub.id).await?;
+                        }
+                        s.last_case = None;
+                        s.due_at = now + 7 * DAY;
+                        put(&mut *tx, Some(p.id), &s).await?;
                     }
-                    s.last_case = None;
-                    s.due_at = now + 7 * DAY;
-                    put(&mut *tx, Some(p.id), &s).await?;
                 }
             }
+            tx.commit().await?;
         }
-        tx.commit().await?;
     }
     Ok(())
 }
 async fn hold_after_outage(engine: &Engine) -> Result<()> {
-    let mut tx = engine.db.begin().await?;
-    let plans = list::<Plan>(&mut *tx, None).await?;
-    tx.commit().await?;
-    for p in plans {
+    let mut after = None;
+    loop {
         let mut tx = engine.db.begin().await?;
-        tx.lock(Kind::Plan, p.id).await?;
-        let mut plan: Plan = get(&mut *tx, p.id).await?;
-        let now = tx.now().await?;
-        let delay = list::<application::Secret>(&mut *tx, Some(p.id))
-            .await?
-            .iter()
-            .map(|s| s.policy.timing.release_delay_seconds)
-            .max()
-            .unwrap_or(plan.timing.release_delay_seconds);
-        if plan.hold_until <= now {
-            let profile: application::Profile = get(&mut *tx, plan.profile_id).await?;
-            application::notice(&mut *tx, plan.id, profile.owner_id, "outage-hold", now).await?;
-        }
-        plan.hold_until = plan.hold_until.max(now + delay);
-        put(&mut *tx, Some(plan.profile_id), &plan).await?;
+        let plans = tx.page(Kind::Plan, None, after, 100).await?;
         tx.commit().await?;
+        if plans.is_empty() {
+            break;
+        }
+        for raw in plans {
+            let p: Plan = serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+            after = Some(p.id);
+            let mut tx = engine.db.begin().await?;
+            tx.lock(Kind::Plan, p.id).await?;
+            let mut plan: Plan = get(&mut *tx, p.id).await?;
+            let now = tx.now().await?;
+            let delay = list::<application::Secret>(&mut *tx, Some(p.id))
+                .await?
+                .iter()
+                .map(|s| s.policy.timing.release_delay_seconds)
+                .max()
+                .unwrap_or(plan.timing.release_delay_seconds);
+            if plan.hold_until <= now {
+                let profile: application::Profile = get(&mut *tx, plan.profile_id).await?;
+                application::notice(&mut *tx, plan.id, profile.owner_id, "outage-hold", now)
+                    .await?;
+            }
+            plan.hold_until = plan.hold_until.max(now + delay);
+            put(&mut *tx, Some(plan.profile_id), &plan).await?;
+            tx.commit().await?;
+        }
     }
     Ok(())
 }

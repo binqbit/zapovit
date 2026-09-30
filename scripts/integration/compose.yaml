@@ -1,0 +1,23 @@
+# Disposable synthetic integration environment; never use with a live project.
+services:
+  app:
+    environment:
+      TELEGRAM_API_BASE: http://fake-telegram:8081
+    depends_on:
+      fake-telegram: {condition: service_started}
+  fake-telegram:
+    image: ${FIXTURE_IMAGE:?Set the synthetic fixture image}
+    build:
+      # Compose resolves every path from the first file, the repository compose.yaml.
+      context: .
+      target: integration-fixture
+    pull_policy: never
+    networks: [private]
+    ports: ['127.0.0.1::8081']
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+  db:
+    ports: ['127.0.0.1::5432']
+  object-storage:
+    ports: ['127.0.0.1::3900']

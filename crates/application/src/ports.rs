@@ -29,19 +29,155 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperationalBlocker {
+    Maintenance,
+    PollStale,
+    SchedulerStale,
+    ControlBacklog,
+    QuarantinedControl,
+    Hold,
+    IntegrityFailure,
+}
+
+#[derive(Clone, Debug)]
+pub struct OperationalStatus {
+    pub ready: bool,
+    pub writes_ready: bool,
+    pub hold_until: Option<i64>,
+    pub reasons: Vec<OperationalBlocker>,
+}
+
 #[async_trait]
 pub trait Transaction: Send {
     async fn now(&mut self) -> Result<i64>;
     async fn operational_ready(&mut self) -> Result<bool>;
+    async fn operational_status(&mut self, _plan_id: Option<Id>) -> Result<OperationalStatus> {
+        let ready = self.operational_ready().await?;
+        Ok(OperationalStatus {
+            ready,
+            writes_ready: self.writes_ready().await?,
+            hold_until: None,
+            reasons: if ready {
+                vec![]
+            } else {
+                vec![OperationalBlocker::Hold]
+            },
+        })
+    }
     async fn writes_ready(&mut self) -> Result<bool>;
     async fn lock(&mut self, kind: Kind, id: Id) -> Result<()>;
     async fn get(&mut self, kind: Kind, id: Id) -> Result<Option<Value>>;
     async fn list(&mut self, kind: Kind, scope: Option<Id>) -> Result<Vec<Value>>;
+    async fn page(
+        &mut self,
+        kind: Kind,
+        scope: Option<Id>,
+        after: Option<Id>,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        Ok(self
+            .list(kind, scope)
+            .await?
+            .into_iter()
+            .filter(|value| {
+                after.is_none_or(|after| {
+                    value["id"]
+                        .as_str()
+                        .and_then(|id| Id::parse_str(id).ok())
+                        .is_some_and(|id| id > after)
+                })
+            })
+            .take(limit.clamp(1, 1000) as usize)
+            .collect())
+    }
+    async fn related_secrets(
+        &mut self,
+        actor: Id,
+        after: Option<Id>,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        let actor = Value::String(actor.to_string());
+        Ok(self
+            .list(Kind::Secret, None)
+            .await?
+            .into_iter()
+            .filter(|v| {
+                ["guardians", "recipients"].iter().any(|role| {
+                    v["policy"][role]
+                        .as_array()
+                        .is_some_and(|ids| ids.contains(&actor))
+                })
+            })
+            .filter(|value| {
+                after.is_none_or(|after| {
+                    value["id"]
+                        .as_str()
+                        .and_then(|id| Id::parse_str(id).ok())
+                        .is_some_and(|id| id > after)
+                })
+            })
+            .take(limit.clamp(1, 1000) as usize)
+            .collect())
+    }
     async fn find(&mut self, kind: Kind, field: &str, value: &str) -> Result<Vec<Value>>;
     async fn due(&mut self, kind: Kind, now: i64, limit: i64) -> Result<Vec<Value>>;
+    async fn expired(
+        &mut self,
+        kind: Kind,
+        scope: Option<Id>,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        Ok(self
+            .list(kind, scope)
+            .await?
+            .into_iter()
+            .filter(|value| value["expires_at"].as_i64().is_some_and(|at| at <= before))
+            .take(limit.clamp(1, 1000) as usize)
+            .collect())
+    }
+    async fn active_cases(&mut self, secret: Id) -> Result<Vec<Value>> {
+        Ok(self
+            .list(Kind::Case, Some(secret))
+            .await?
+            .into_iter()
+            .filter(|value| {
+                value["case"]["state"].as_str().is_some_and(|state| {
+                    matches!(
+                        state,
+                        "collecting" | "waiting" | "ready" | "delivering" | "partial"
+                    )
+                })
+            })
+            .collect())
+    }
     async fn put(&mut self, kind: Kind, id: Id, scope: Option<Id>, value: Value) -> Result<()>;
     async fn remove(&mut self, kind: Kind, id: Id) -> Result<()>;
     async fn rate_limit(&mut self, key: &str, capacity: i64, period: i64) -> Result<bool>;
+    /// Reserve before external PUT/expensive work. The stable reservation ID makes retries idempotent.
+    async fn reserve_resource(
+        &mut self,
+        _resource: &str,
+        _reservation_id: Id,
+        _amount: i64,
+        _capacity: i64,
+    ) -> Result<bool> {
+        Err(Error::Storage)
+    }
+    /// Release only when the physical resource is confirmed gone, not merely queued for deletion.
+    async fn release_resource(&mut self, _resource: &str, _reservation_id: Id) -> Result<()> {
+        Err(Error::Storage)
+    }
+    /// Only call after credential verification (or authenticated control replay).
+    async fn admit_recovery_account(
+        &mut self,
+        _account: &crate::Account,
+        _profile_id: Id,
+        _selector: Id,
+    ) -> Result<()> {
+        Err(Error::Storage)
+    }
     async fn commit(self: Box<Self>) -> Result<()>;
 }
 

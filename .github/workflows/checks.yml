@@ -23,10 +23,61 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo test -p adapters --test pipeline --locked -- --include-ignored --test-threads=1
+      - run: cargo test -p adapters --test backup_protocol --locked -- --ignored --skip garage_ --test-threads=1
       - run: cargo test -p app lost_leader_session --locked -- --include-ignored
       - run: cargo test -p app --test startup --locked -- --include-ignored
       - run: docker compose config --quiet
       - run: python3 scripts/test_backup_env.py
       - run: bash -n scripts/backup.sh
+      - run: python3 -m py_compile scripts/integration/compose_smoke.py
       - run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit
       - run: cargo install cargo-deny --version 0.20.2 --locked && cargo deny check
+  container-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: sudo apt-get update && sudo apt-get install -y age
+      - id: smoke
+        run: python3 scripts/integration/compose_smoke.py
+      - name: Container SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.smoke.outputs.image }}
+          format: cyclonedx
+          output: .agent-workspace/artifacts/container-sbom.json
+      - name: Container vulnerability gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.smoke.outputs.image }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: false
+          format: json
+          output: .agent-workspace/artifacts/container-vulnerabilities.json
+      - name: Rust dependency SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          skip-dirs: .agent-workspace,target,.git
+          format: cyclonedx
+          output: .agent-workspace/artifacts/dependency-sbom.json
+      - name: Preserve non-secret verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-recovery-evidence
+          include-hidden-files: true
+          retention-days: 14
+          path: |
+            .agent-workspace/artifacts/compose-*/report.json
+            .agent-workspace/artifacts/compose-*/build-app.log
+            .agent-workspace/artifacts/compose-*/build-fixture.log
+            .agent-workspace/artifacts/compose-*/garage-and-backup-contracts.log
+            .agent-workspace/artifacts/container-sbom.json
+            .agent-workspace/artifacts/container-vulnerabilities.json
+            .agent-workspace/artifacts/dependency-sbom.json

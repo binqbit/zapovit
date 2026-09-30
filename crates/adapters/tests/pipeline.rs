@@ -119,6 +119,10 @@ async fn participants(f: &Fixture) -> (Account, Id, Vec<Account>) {
         .acknowledge_recovery(owner.id, plan, profile.recovery_selector)
         .await
         .unwrap();
+    let people = confirmed_people(f, &owner, plan).await;
+    (owner, plan, people)
+}
+async fn confirmed_people(f: &Fixture, owner: &Account, plan: Id) -> Vec<Account> {
     let mut people = Vec::new();
     for id in 2001..=2005 {
         let a = f.engine.account(id, id, "en").await.unwrap();
@@ -138,7 +142,7 @@ async fn participants(f: &Fixture) -> (Account, Id, Vec<Account>) {
             .unwrap();
         people.push(a);
     }
-    (owner, plan, people)
+    people
 }
 async fn secret(
     f: &Fixture,
@@ -215,6 +219,22 @@ async fn secret(
     (secret, codes)
 }
 async fn inactive(f: &Fixture, owner: Id, plan: Id, secret: Id) -> Id {
+    // This helper intentionally starts a new active inactivity case. A scoped STOP
+    // now needs its own explicit resumption before the plan can resume monitoring.
+    let mut tx = f.engine.db.begin().await.unwrap();
+    let stopped = get::<Secret>(&mut *tx, secret).await.unwrap().state == SecretState::Paused;
+    tx.commit().await.unwrap();
+    if stopped {
+        f.engine
+            .control(
+                owner,
+                plan,
+                Id::new_v4(),
+                Control::RearmSecret { secret_id: secret },
+            )
+            .await
+            .unwrap();
+    }
     f.engine
         .control(owner, plan, Id::new_v4(), Control::Rearm)
         .await
@@ -715,3 +735,9 @@ mod engine_validation;
 
 #[path = "pipeline_cases/late_delivery.rs"]
 mod late_delivery;
+
+#[path = "pipeline_cases/runtime.rs"]
+mod runtime;
+
+#[path = "pipeline_cases/product_behavior.rs"]
+mod product_behavior;

@@ -30,6 +30,119 @@ async fn dispatching_delivery(f: &Fixture) -> (Account, Id, Id, Id, Job) {
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
+async fn routed_retry_confirmation_can_progress_while_later_stop_fences_dispatch() {
+    let f = fixture().await;
+    let (owner, plan, secret, _, job) = dispatching_delivery(&f).await;
+    f.engine
+        .finish_job(job.id, job.lease_token, SendResult::Unknown)
+        .await
+        .unwrap();
+    let mut tx = f.db.begin().await.unwrap();
+    let part = list::<DeliveryPart>(&mut *tx, Some(secret))
+        .await
+        .unwrap()
+        .remove(0);
+    let recipient: Account = get(&mut *tx, part.recipient_id).await.unwrap();
+    let current: Plan = get(&mut *tx, plan).await.unwrap();
+    let now = tx.now().await.unwrap();
+    let action = Action {
+        id: Id::new_v4(),
+        actor_id: recipient.id,
+        plan_id: Some(plan),
+        owner_epoch: None,
+        epoch: Some(current.epoch),
+        name: "retry-confirmed".into(),
+        target: Some(part.id),
+        expires_at: now + DAY,
+        used: false,
+    };
+    put(&mut *tx, Some(plan), &action).await.unwrap();
+    tx.commit().await.unwrap();
+    let retry = serde_json::json!({"update_id":701,"callback_query":{"id":"synthetic-retry","data":action.id.to_string(),"from":{"id":recipient.telegram_id,"is_bot":false},"message":{"message_id":701,"chat":{"id":recipient.chat_id,"type":"private"}}}});
+    let route = f.db.route_update(&retry).await.unwrap();
+    assert!(route.plans.contains(&plan));
+    assert!(
+        !route.protective,
+        "a delivery retry must not wait on its own inbox barrier"
+    );
+    let event = Id::from_u128((100_u128 << 64) | 701);
+    let envelope = f
+        .engine
+        .crypto
+        .wrap(
+            "telegram-inbox",
+            event,
+            &serde_json::to_vec(&retry).unwrap(),
+        )
+        .unwrap();
+    f.db.ingest_routed(
+        100,
+        &[adapters::postgres::RoutedUpdate {
+            update_id: 701,
+            envelope,
+            route,
+        }],
+    )
+    .await
+    .unwrap();
+    let claim = f.db.claim_update(100, false).await.unwrap().unwrap();
+    assert_eq!(claim.update_id, 701);
+    // This is the same use case called by BotUi while its inbox lease is active.
+    f.engine
+        .retry_delivery(recipient.id, part.id)
+        .await
+        .unwrap();
+    assert!(f.db.finish_update(100, &claim).await.unwrap());
+    let mut tx = f.db.begin().await.unwrap();
+    let retry_job = list::<Job>(&mut *tx, Some(plan))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|j| {
+            j.id != job.id && matches!(j.task, Task::Deliver { part_id, .. } if part_id == part.id)
+        })
+        .unwrap();
+    tx.commit().await.unwrap();
+    let retry_job = f.engine.claim_job(retry_job.id).await.unwrap().unwrap();
+    let stop = serde_json::json!({"update_id":702,"message":{"message_id":702,"from":{"id":owner.telegram_id,"is_bot":false},"chat":{"id":owner.chat_id,"type":"private"},"text":"/stop"}});
+    let route = f.db.route_update(&stop).await.unwrap();
+    let event = Id::from_u128((100_u128 << 64) | 702);
+    let envelope = f
+        .engine
+        .crypto
+        .wrap("telegram-inbox", event, &serde_json::to_vec(&stop).unwrap())
+        .unwrap();
+    f.db.ingest_routed(
+        100,
+        &[adapters::postgres::RoutedUpdate {
+            update_id: 702,
+            envelope,
+            route,
+        }],
+    )
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM rate_limits WHERE key LIKE 'outbound:%'")
+        .execute(&f.db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !f.engine
+            .authorize_dispatch(&retry_job, recipient.chat_id)
+            .await
+            .unwrap(),
+        "a later accepted STOP still fences the explicit retry before dispatch"
+    );
+    let mut tx = f.db.begin().await.unwrap();
+    assert_eq!(
+        get::<Job>(&mut *tx, retry_job.id).await.unwrap().state,
+        PartState::Claimed,
+        "the refusal is the protective barrier, not outbound throttling"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
 async fn late_delivery_result_cannot_lift_secret_stop_after_checkin() {
     for (result, expected) in [
         (SendResult::Unknown, PartState::Unknown),

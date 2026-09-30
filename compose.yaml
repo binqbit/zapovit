@@ -1,9 +1,9 @@
 name: zapovit
 
 x-app: &app
-  image: zapovit:local
+  image: ${APP_IMAGE:-zapovit:local}
   build: .
-  pull_policy: build
+  pull_policy: ${APP_PULL_POLICY:-build}
   user: "${APP_UID:-10001}:${APP_GID:-10001}"
   read_only: true
   cap_drop: [ALL]
@@ -24,6 +24,7 @@ x-app: &app
     S3_BUCKET: zapovit
     HEALTH_BIND: 0.0.0.0:8080
     JOURNAL_DIR: /var/lib/zapovit/journal
+    JOURNAL_REPLICA_DIR: ${JOURNAL_REPLICA_DIR:-}
     TELEGRAM_API_BASE: ${TELEGRAM_API_BASE:-https://api.telegram.org}
     WORKERS: ${WORKERS:-4}
     DATABASE_POOL: ${DATABASE_POOL:-10}

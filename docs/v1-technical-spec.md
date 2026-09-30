@@ -1,5 +1,7 @@
 # Zapovit V1 — технічне завдання
 
+> Implementation update (30 September 2026): the public-service iteration adds scoped secret resume, separate draft/input sessions, explicit invitation/deletion flows, operational readiness, bounded queues and backup/restore sessions. See [operations](operations.md) for current behavior and [production plan](production-plan.md) for the accepted changes and release gates. The original design below remains background where not superseded.
+
 Дата перевірки зовнішніх джерел: **6 вересня 2026 року**.
 
 Функціональний обсяг визначає [V1](v1.md). [Загальна концепція](concept.md) дає контекст майбутнього розвитку, але не додає функцій до цього релізу. Команди запуску реалізації наведено в [інструкції експлуатації](operations.md), результати перевірок і межі допуску — у [звіті перевірки](verification.md). Незалежний аудит готового сервісу залишається окремою умовою роботи з реальними секретами.

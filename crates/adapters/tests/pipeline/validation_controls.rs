@@ -22,6 +22,16 @@ async fn unready_rearm_is_not_journaled_and_stale_snapshot_replay_stays_paused()
         .acknowledge_recovery(owner.id, plan_id, snapshot_profile.recovery_selector)
         .await
         .unwrap();
+    // Saving recovery alone no longer activates an empty plan.
+    assert!(
+        f.engine
+            .control(owner.id, plan_id, Id::new_v4(), Control::Rearm)
+            .await
+            .is_err()
+    );
+    assert!(f.engine.journal.read().await.unwrap().is_empty());
+    let people = confirmed_people(&f, &owner, plan_id).await;
+    secret(&f, &owner, plan_id, &people, false).await;
     let operation = Id::new_v4();
     f.engine
         .control(owner.id, plan_id, operation, Control::Rearm)

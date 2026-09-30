@@ -13,5 +13,6 @@ time.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 zeroize.workspace = true
+tokio.workspace = true
 [lints]
 workspace = true

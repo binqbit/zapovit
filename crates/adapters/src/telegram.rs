@@ -25,6 +25,13 @@ pub enum DeleteResult {
     RetryAfter(i64),
     Permanent,
 }
+/// Presentation only: callback data remains an opaque, actor-bound action ID.
+#[derive(Clone)]
+pub struct MenuButton {
+    pub text: String,
+    pub data: String,
+    pub style: Option<&'static str>,
+}
 impl Telegram {
     pub fn new(base: &str, token: Zeroizing<String>) -> Result<Self> {
         let url = reqwest::Url::parse(base).map_err(|_| Error::Config)?;
@@ -291,24 +298,75 @@ impl Telegram {
         text: &str,
         buttons: Vec<(String, String)>,
     ) -> SendResult {
+        let rows = buttons
+            .into_iter()
+            .map(|(text, data)| {
+                vec![MenuButton {
+                    text,
+                    data,
+                    style: None,
+                }]
+            })
+            .collect();
+        self.menu_message(chat, Some(message), text, rows).await
+    }
+    /// Render an ordinary navigation card. Secret content uses send_block instead.
+    pub async fn menu_message(
+        &self,
+        chat: i64,
+        message: Option<i64>,
+        text: &str,
+        rows: Vec<Vec<MenuButton>>,
+    ) -> SendResult {
         if text.is_empty() || text.encode_utf16().count() > 4096 {
+            return SendResult::Permanent;
+        }
+        if rows.iter().any(|row| {
+            row.is_empty()
+                || row.len() > 2
+                || row.iter().any(|b| {
+                    b.text.is_empty()
+                        || b.data.is_empty()
+                        || b.data.len() > 64
+                        || b.style
+                            .is_some_and(|s| !["primary", "success", "danger"].contains(&s))
+                })
+        }) {
             return SendResult::Permanent;
         }
         if let Some(seconds) = self.remaining_cooldown().await {
             return SendResult::RetryAfter(seconds);
         }
         self.reserve_send(chat).await;
-        let keyboard: Vec<_> = buttons
+        let keyboard: Vec<Vec<Value>> = rows
             .into_iter()
-            .map(|(text, data)| vec![json!({"text": text, "callback_data": data})])
+            .map(|row| {
+                row.into_iter()
+                    .map(|button| {
+                        let mut value = json!({"text":button.text,"callback_data":button.data});
+                        if let Some(style) = button.style {
+                            value["style"] = json!(style);
+                        }
+                        value
+                    })
+                    .collect()
+            })
             .collect();
+        let mut body = json!({"chat_id":chat,"text":text,
+            "entities":[],"link_preview_options":{"is_disabled":true},
+            "reply_markup":{"inline_keyboard":keyboard}});
+        if let Some(id) = message {
+            body["message_id"] = json!(id);
+        }
         let response = self
             .client
-            .post(self.url("editMessageText"))
+            .post(self.url(if message.is_some() {
+                "editMessageText"
+            } else {
+                "sendMessage"
+            }))
             .timeout(Duration::from_secs(15))
-            .json(&json!({"chat_id":chat,"message_id":message,"text":text,
-                "entities":[],"link_preview_options":{"is_disabled":true},
-                "reply_markup":{"inline_keyboard":keyboard}}))
+            .json(&body)
             .send()
             .await;
         let result = Self::classify(response).await;

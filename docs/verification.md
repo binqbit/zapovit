@@ -1,6 +1,36 @@
 # Implementation verification
 
-## Repository and Telegram UX review on 30 September 2026
+## Public-service implementation on 30 September 2026
+
+Implemented the accepted [production plan](production-plan.md) within the existing domain → application/ports → adapters → runtime structure. The Telegram adapter projects Engine readiness and uses Engine-authorized operations; button visibility never grants authority. This iteration adds private metadata, contact/invitation lifecycle, independent draft/prompt sessions, block editing, explicit sealing/deletion, scoped resume, recipient views and operation receipts. Runtime work covers ordering, leases, quarantine, resource reservations, bounded scans, freshness, backup sessions and mirrored journal durability. Migrations `0002`–`0004` preserve the original `0001` checksum.
+
+The current validation uses Rust 1.98.1, PostgreSQL 17.11, native Garage 2.4.0, loopback Telegram and synthetic fixtures. No real Telegram recipient or deployment credentials were used.
+
+| Check | Evidence and scope |
+| --- | --- |
+| Default workspace | 48 tests passed, including cryptography, localization, journal fault cases, shared I/O deadlines and Telegram contracts |
+| PostgreSQL integration | All 75 cases passed together, including menu guidance, recovery admission, full queue backpressure and cached-authority revalidation |
+| App database tests | Leadership-loss and automatic journal initialization tests passed |
+| Backup protocol | Five PostgreSQL tests passed, including original-schema upgrade, session/restore fencing and 10,002-row export with paged and legacy manifest import |
+| Real Garage | Two additional Rust contracts passed: 1 MiB PUT/HEAD/GET/bounded GET/DELETE, and exact-byte backup/import with tampered-manifest rejection; storage bootstrap and its idempotent repeat also passed |
+| Static/dependency checks | Formatting, all-target locked Clippy with warnings denied, cargo-audit and cargo-deny passed; deny retains permitted duplicate-version/unmatched-license warnings |
+| Operational scripts/docs | Ten Python backup tests, shell/Python syntax, merged Compose configuration, diff whitespace and local documentation links passed |
+
+This covers **133 distinct Rust tests and ten Python tests**, counting the separately executed backup, Garage and journal-scale cases once. The final workspace + 75-case pipeline + two app cases ran together with an unchanged source fingerprint; the other contracts have their own retained reports. No named Rust test remains covered only by its default ignored status.
+
+Pre-commit review then corrected only English/Ukrainian copy: the missing contact-details fallback and references to the renamed People menu. Locale validation passed again, and all 132 literal Telegram translation calls were checked for missing keys. These copy corrections do not imply another complete database test run.
+
+The initial integrated run passed 55/58 tests. One failure exposed a missing inactivity deadline on the secret card and was fixed in the UI. Two historical control fixtures assumed that an empty plan or an individually stopped secret could be resumed through plan activation; the fixtures now prepare a real ready secret or explicitly resume that secret, preserving their safety assertions. Separate review found and fixed stale draft callbacks cancelling unrelated prompts, late credentials being interpreted as draft content, non-atomic upload enqueue/state transitions, completed mutation results hidden by expired UI state, and explicit recipient retries blocked by their own routed inbox barrier. Original failures and subsequent passing evidence are retained locally.
+
+A fresh advisory scan found [RUSTSEC-2026-0285 / the upstream rustls advisory](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc). The lockfile now uses rustls **0.23.45**; the subsequent scan reports no vulnerabilities or advisory warnings. This is a dependency correction, not an independent security assessment of Zapovit.
+
+The journal scale probe appended and replayed **10,000 records / 6,278,830 bytes** using two fsynced local copies. Append phase: 119.11 seconds. First/last 100 appends had p95 **9.714 / 31.452 ms** (p50 7.270 / 26.011 ms). This was a debug build on a concurrently used filesystem, with both copies on one host. It demonstrates the bounded incremental append path at this workload, not a production latency SLO or independent-host durability.
+
+Local evidence lives in ignored `.agent-workspace/artifacts/`: the final full matrix (`pg-k0q7svzj`), earlier integration checkpoint (`pg-bmjca9b7`), final navigation (`pg-gqcw_o2y`), native Garage (`pg-v9_w7eg2`), backup sessions (`pg-_c5_vmii`, `pg-crxeppby`), runtime regressions (`pg-qewgc6je`, `pg-1nm6vog_`), journal probe and static/dependency logs. These are private local artifacts, not prerequisites for CI. Maintained tests and the disposable Compose runner are tracked. The native Garage executable was byte-for-byte verified against the binary extracted from the repository's digest-pinned OCI image; provenance is retained with the local binary. All temporary database/storage services were stopped after their checks.
+
+**Still required before a public release:** the configured Docker/Compose/age recovery job and image scans must actually pass; Docker daemon access here was denied. The real Garage contracts do not replace container UID/network/mount or complete encrypted-wrapper testing. PostgreSQL 18.6 remains the CI target. Real Telegram Android/iOS/Desktop usability, novice-user trials, independent threshold/security review, an incident owner/support contact/alert routing, independently durable journal storage with a current witness, host-loss recovery and measured RPO/RTO/load remain release gates. Advisory UI status still shares a cursor lock with dispatch readiness; its polling impact must be included in public-load measurements. `DATA_MODE=synthetic` remains enforced.
+
+## Earlier repository and Telegram UX review on 30 September 2026
 
 Verified with Rust 1.98.1, native PostgreSQL 17.11, loopback Telegram mocks and synthetic fixtures. The pinned toolchain was selected explicitly because the host's default Cargo/Rust binaries were 1.97.1.
 

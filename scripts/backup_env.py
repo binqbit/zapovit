@@ -29,6 +29,7 @@ APP_VARIABLES = (
     "DATABASE_POOL",
 )
 CAPTURED_VARIABLES = APP_VARIABLES + (
+    "JOURNAL_REPLICA_DIR",
     "APP_UID",
     "APP_GID",
     "DATABASE_PASSWORD",
@@ -63,7 +64,9 @@ def inspect_service(service):
         records = json.loads(docker_output(["inspect", ids[0].decode("ascii")]))
         if len(records) != 1 or records[0]["State"]["Running"] is not True:
             raise ValueError
-        return records[0]["Config"]
+        config = records[0]["Config"]
+        config["_ImageID"] = records[0]["Image"]
+        return config
     except (KeyError, TypeError, ValueError):
         raise CaptureError(f"Invalid inspection result for {service}.") from None
 
@@ -90,6 +93,7 @@ def required(values, name):
 def captured_values(app, db, garage):
     app_env = environment(app)
     result = {name: required(app_env, name) for name in APP_VARIABLES}
+    result["JOURNAL_REPLICA_DIR"] = app_env.get("JOURNAL_REPLICA_DIR", "")
     identity = app.get("User", "")
     if not re.fullmatch(r"[0-9]+:[0-9]+", identity):
         raise CaptureError("The app container must use a numeric UID:GID.")
@@ -136,15 +140,25 @@ def dotenv(values):
     )
 
 
-def capture(destination):
-    values = captured_values(
-        inspect_service("app"), inspect_service("db"), inspect_service("object-storage")
-    )
+def capture(destination, metadata_destination=None):
+    records = [inspect_service(name) for name in ("app", "db", "object-storage")]
+    values = captured_values(*records)
     # Exclusive creation also refuses a pre-existing symlink. The parent backup
     # stage is private; never overwrite another recovery configuration.
     descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
         output.write(dotenv(values))
+    if metadata_destination is not None:
+        images = {}
+        for name, record in zip(("app", "db", "object-storage"), records):
+            image = record.get("_ImageID", "")
+            if not re.fullmatch(r"sha256:[a-f0-9]{64}", image):
+                raise CaptureError("Running container image identifier is invalid.")
+            images[name] = image
+        descriptor = os.open(metadata_destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump({"format": 1, "images": images}, output, indent=2)
+            output.write("\n")
 
 
 def run_with_runtime(source, arguments):
@@ -154,6 +168,15 @@ def run_with_runtime(source, arguments):
     for name in CAPTURED_VARIABLES:
         inherited.pop(name, None)
     inherited.pop("COMPOSE_ENV_FILES", None)
+    inherited.pop("APP_IMAGE", None)
+    inherited.pop("APP_PULL_POLICY", None)
+    metadata = Path(source).resolve().with_name("deployment.json")
+    if metadata.is_file():
+        image = json.loads(metadata.read_text())["images"]["app"]
+        if not re.fullmatch(r"sha256:[a-f0-9]{64}", image):
+            raise CaptureError("Backup application image identifier is invalid.")
+        inherited["APP_IMAGE"] = image
+        inherited["APP_PULL_POLICY"] = "never"
     try:
         return subprocess.run(
             ["docker", "compose", "--env-file", str(Path(source).resolve()), *arguments],
@@ -165,8 +188,8 @@ def run_with_runtime(source, arguments):
 
 
 def main(arguments):
-    if len(arguments) == 2 and arguments[0] == "capture":
-        capture(arguments[1])
+    if len(arguments) in (2, 3) and arguments[0] == "capture":
+        capture(*arguments[1:])
         return 0
     if len(arguments) >= 3 and arguments[0] == "run":
         return run_with_runtime(arguments[1], arguments[2:])
@@ -179,7 +202,7 @@ if __name__ == "__main__":
     except CaptureError as error:
         print(f"Backup configuration step failed: {error}", file=sys.stderr)
         sys.exit(1)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, KeyError):
         # Do not echo subprocess stderr, inspected JSON or exception arguments:
         # any of them could contain a credential.
         print("Backup configuration step failed; verify running services and private output path.", file=sys.stderr)

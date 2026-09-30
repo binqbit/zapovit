@@ -1,7 +1,11 @@
 use super::menu_navigation::{Screens, button, callback, command, labels, last, press};
 use super::*;
 use adapters::{bot::BotUi, localization::tr, telegram::Telegram};
-use axum::{Json, Router, extract::Path, routing::post};
+use axum::{
+    Json, Router,
+    extract::Path,
+    routing::{get as http_get, post},
+};
 use serde_json::{Value, json};
 
 async fn ui(f: &Fixture) -> (BotUi, Screens, tokio::task::JoinHandle<()>) {
@@ -15,11 +19,18 @@ async fn ui(f: &Fixture) -> (BotUi, Screens, tokio::task::JoinHandle<()>) {
                 if method == "answerCallbackQuery" {
                     return Json(json!({"ok":true,"result":true}));
                 }
+                if method == "getFile" {
+                    return Json(json!({"ok": true, "result": {"file_path": "synthetic.txt", "file_size": 4}}));
+                }
                 assert!(matches!(method.as_str(), "sendMessage" | "editMessageText"));
                 screens.lock().await.push((method, body));
                 Json(json!({"ok":true,"result":{"message_id":42}}))
             }
         }),
+    );
+    let app = app.route(
+        "/file/bot1:test/synthetic.txt",
+        http_get(|| async { "test" }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -68,19 +79,23 @@ async fn ready_draft(f: &Fixture, owner: &Account, plan: Id, people: &[Account])
     put(
         &mut *tx,
         Some(plan),
-        &Dialog {
+        &DraftSession {
             id: owner.id,
-            plan_id: Some(plan),
-            owner_epoch: Some(profile.owner_epoch),
-            step: "ready".into(),
-            draft_id: Some(draft),
-            expires_at: now + 900,
-            selected: Default::default(),
-            reply_to: None,
-            case_id: None,
-            guardians: policy.guardians,
-            recipients: policy.recipients,
-            threshold: 1,
+            dialog: Dialog {
+                id: owner.id,
+                plan_id: Some(plan),
+                owner_epoch: Some(profile.owner_epoch),
+                step: "ready".into(),
+                draft_id: Some(draft),
+                expires_at: now + 900,
+                selected: Default::default(),
+                reply_to: None,
+                case_id: None,
+                guardians: policy.guardians,
+                recipients: policy.recipients,
+                threshold: 1,
+                timing: Some(policy.timing),
+            },
         },
     )
     .await
@@ -91,7 +106,10 @@ async fn ready_draft(f: &Fixture, owner: &Account, plan: Id, people: &[Account])
 
 async fn dialog(f: &Fixture, owner: &Account) -> Dialog {
     let mut tx = f.db.begin().await.unwrap();
-    get(&mut *tx, owner.id).await.unwrap()
+    get::<DraftSession>(&mut *tx, owner.id)
+        .await
+        .unwrap()
+        .dialog
 }
 
 #[tokio::test]
@@ -104,7 +122,6 @@ async fn draft_buttons_cannot_apply_to_another_step_revision_or_draft() {
     let (ui, screens, server) = ui(&f).await;
     let mut seq = 12000;
     command(&ui, &mut seq, owner.telegram_id, "/start").await;
-    press(&ui, &screens, &mut seq, owner.telegram_id, "My plan").await;
     press(&ui, &screens, &mut seq, owner.telegram_id, "Continue draft").await;
     let old_save = button(&last(&screens).await, "Save and encrypt");
     press(
@@ -122,7 +139,7 @@ async fn draft_buttons_cannot_apply_to_another_step_revision_or_draft() {
         &screens,
         &mut seq,
         owner.telegram_id,
-        "Choose trusted people",
+        "Change people and timing",
     )
     .await;
     let guardian_toggle = button(&last(&screens).await, "○ 2002");
@@ -143,8 +160,8 @@ async fn draft_buttons_cannot_apply_to_another_step_revision_or_draft() {
         "Set my own intervals",
     )
     .await;
-    command(&ui, &mut seq, owner.telegram_id, "7 10 7").await;
-    assert_eq!(dialog(&f, &owner).await.step, "timing");
+    command(&ui, &mut seq, owner.telegram_id, "0").await;
+    assert_eq!(dialog(&f, &owner).await.step, "timing-reminder");
     assert!(
         screens
             .lock()
@@ -152,7 +169,9 @@ async fn draft_buttons_cannot_apply_to_another_step_revision_or_draft() {
             .iter()
             .any(|(_, body)| body["text"] == tr("en", "invalid-timing"))
     );
-    command(&ui, &mut seq, owner.telegram_id, "7 28 7").await;
+    command(&ui, &mut seq, owner.telegram_id, "7").await;
+    command(&ui, &mut seq, owner.telegram_id, "28").await;
+    command(&ui, &mut seq, owner.telegram_id, "7").await;
     assert_eq!(dialog(&f, &owner).await.step, "ready");
     callback(&ui, &mut seq, owner.telegram_id, old_save.clone()).await;
     assert_eq!(last(&screens).await["text"], tr("en", "stale-action"));
@@ -174,6 +193,15 @@ async fn draft_buttons_cannot_apply_to_another_step_revision_or_draft() {
         "Save and encrypt",
     )
     .await;
+    let sealed = button(&last(&screens).await, "I understand — encrypt and save");
+    callback(&ui, &mut seq, owner.telegram_id, sealed.clone()).await;
+    callback(&ui, &mut seq, owner.telegram_id, sealed).await;
+    assert!(
+        last(&screens).await["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(&tr("en", "history-explained"))
+    );
     let second = ready_draft(&f, &owner, plan, &people).await;
     assert_ne!(first, second);
     callback(&ui, &mut seq, owner.telegram_id, old_save).await;
@@ -206,7 +234,6 @@ async fn draft_selection_resumes_and_updates_in_place_after_settings() {
     let (ui, screens, server) = ui(&f).await;
     let mut seq = 13000;
     command(&ui, &mut seq, owner.telegram_id, "/start").await;
-    press(&ui, &screens, &mut seq, owner.telegram_id, "My plan").await;
     press(&ui, &screens, &mut seq, owner.telegram_id, "Continue draft").await;
     press(
         &ui,
@@ -221,7 +248,6 @@ async fn draft_selection_resumes_and_updates_in_place_after_settings() {
     let before = dialog(&f, &owner).await;
     command(&ui, &mut seq, owner.telegram_id, "/settings").await;
     press(&ui, &screens, &mut seq, owner.telegram_id, "← Back").await;
-    press(&ui, &screens, &mut seq, owner.telegram_id, "My plan").await;
     press(&ui, &screens, &mut seq, owner.telegram_id, "Continue draft").await;
     assert!(labels(&last(&screens).await).contains(&"✓ 2003"));
     let after = dialog(&f, &owner).await;
@@ -232,10 +258,18 @@ async fn draft_selection_resumes_and_updates_in_place_after_settings() {
     let mut tx = f.db.begin().await.unwrap();
     let mut d = after;
     d.expires_at = 0;
-    put(&mut *tx, Some(plan), &d).await.unwrap();
+    put(
+        &mut *tx,
+        Some(plan),
+        &DraftSession {
+            id: d.id,
+            dialog: d,
+        },
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     command(&ui, &mut seq, owner.telegram_id, "/start").await;
-    press(&ui, &screens, &mut seq, owner.telegram_id, "My plan").await;
     assert!(labels(&last(&screens).await).contains(&"Continue draft"));
     server.abort();
 }
@@ -247,21 +281,24 @@ async fn cancellation_and_deletion_screens_name_their_scope() {
     let (owner, plan, people) = participants(&f).await;
     f.engine.locale(owner.id, "en").await.unwrap();
     let (secret, _) = secret(&f, &owner, plan, &people, false).await;
+    f.engine
+        .control(owner.id, plan, Id::new_v4(), Control::Rearm)
+        .await
+        .unwrap();
     let (ui, screens, server) = ui(&f).await;
     let mut seq = 14000;
     command(&ui, &mut seq, people[0].telegram_id, "/guardians").await;
-    let scope_screen = screens
-        .lock()
-        .await
-        .iter()
-        .map(|(_, body)| body)
-        .find(|body| {
-            body["text"]
-                .as_str()
-                .is_some_and(|text| text.contains(&secret.to_string()))
-        })
-        .unwrap()
-        .clone();
+    let first = labels(&last(&screens).await)[0].to_owned();
+    press(&ui, &screens, &mut seq, people[0].telegram_id, &first).await;
+    press(
+        &ui,
+        &screens,
+        &mut seq,
+        people[0].telegram_id,
+        "More details",
+    )
+    .await;
+    let scope_screen = last(&screens).await;
     let secret_cancel = button(&scope_screen, "Request cancellation of this secret");
     let plan_cancel = button(&scope_screen, "Request cancellation of the whole plan");
     let mut tx = f.db.begin().await.unwrap();
@@ -281,28 +318,277 @@ async fn cancellation_and_deletion_screens_name_their_scope() {
     );
     tx.commit().await.unwrap();
     command(&ui, &mut seq, owner.telegram_id, "/status").await;
-    let delete = screens
-        .lock()
-        .await
-        .iter()
-        .rev()
-        .map(|(_, body)| body)
-        .find(|body| {
-            body["text"]
-                .as_str()
-                .is_some_and(|text| text.starts_with(&secret.to_string()))
-        })
-        .map(|body| button(body, "Delete permanently"))
-        .unwrap();
+    let first = labels(&last(&screens).await)[0].to_owned();
+    press(&ui, &screens, &mut seq, owner.telegram_id, &first).await;
+    let delete = button(&last(&screens).await, "Delete permanently");
     callback(&ui, &mut seq, owner.telegram_id, delete).await;
     assert_eq!(
         last(&screens).await["text"],
         tr("en", "delete-secret-confirm")
     );
     assert!(screens.lock().await.iter().any(|(_, body)| {
-        body["text"].as_str().is_some_and(|text| {
-            text.contains("Last activity confirmation:") && text.contains("UTC")
-        })
+        body["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("UTC"))
     }));
+    let confirmed = button(&last(&screens).await, "Yes, delete permanently");
+    callback(&ui, &mut seq, owner.telegram_id, confirmed.clone()).await;
+    callback(&ui, &mut seq, owner.telegram_id, confirmed).await;
+    assert!(
+        last(&screens).await["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(&tr("en", "history-explained"))
+    );
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn invitation_preview_requires_consent_and_content_waits_for_people() {
+    let f = fixture().await;
+    let owner = f.engine.account(7501, 7501, "en").await.unwrap();
+    let plan = f.engine.create_profile(owner.id).await.unwrap();
+    let (ui, screens, server) = ui(&f).await;
+    let mut seq = 17000;
+    let (_, new) = ui
+        .button(&owner, "new-secret", None, Some(plan), true, "New secret")
+        .await
+        .unwrap();
+    callback(&ui, &mut seq, owner.telegram_id, new).await;
+    assert_eq!(
+        last(&screens).await["text"],
+        tr("en", "prepare-before-content")
+    );
+    let mut tx = f.db.begin().await.unwrap();
+    assert!(
+        list::<Draft>(&mut *tx, Some(plan))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    tx.commit().await.unwrap();
+    let invite = f.engine.invite(owner.id, plan).await.unwrap();
+    command(
+        &ui,
+        &mut seq,
+        7502,
+        &format!("/start invite_{}", invite.simple()),
+    )
+    .await;
+    let guest = f.engine.account(7502, 7502, "en").await.unwrap();
+    assert!(f.engine.own_plan(guest.id).await.is_err());
+    assert!(f.engine.contacts(owner.id, plan).await.unwrap().is_empty());
+    assert!(
+        last(&screens).await["text"]
+            .as_str()
+            .unwrap()
+            .contains("7501")
+    );
+    press(&ui, &screens, &mut seq, 7502, &tr("en", "accept-invite")).await;
+    let contacts = f.engine.contacts(owner.id, plan).await.unwrap();
+    assert_eq!(contacts.len(), 1);
+    assert!(!contacts[0].confirmed);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn upload_finishes_while_separate_prompt_preserves_the_draft() {
+    let f = fixture().await;
+    let (owner, plan, people) = participants(&f).await;
+    f.engine.locale(owner.id, "en").await.unwrap();
+    let draft_id = ready_draft(&f, &owner, plan, &people).await;
+    let mut d = dialog(&f, &owner).await;
+    d.step = "file-pending".into();
+    let mut tx = f.db.begin().await.unwrap();
+    let now = tx.now().await.unwrap();
+    put(
+        &mut *tx,
+        Some(plan),
+        &DraftSession {
+            id: owner.id,
+            dialog: d.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut prompt = d;
+    prompt.draft_id = None;
+    prompt.step = "code".into();
+    put(&mut *tx, Some(plan), &prompt).await.unwrap();
+    let job = Job {
+        id: Id::new_v4(),
+        plan_id: Some(plan),
+        task: Task::DownloadFile {
+            account_id: owner.id,
+            draft_id,
+            file_id: f
+                .engine
+                .crypto
+                .wrap("telegram-file", draft_id, b"synthetic-file")
+                .unwrap(),
+            name: f
+                .engine
+                .crypto
+                .wrap(
+                    "telegram-file-meta",
+                    draft_id,
+                    &serde_json::to_vec(&("test.txt", "")).unwrap(),
+                )
+                .unwrap(),
+            source_message: 99,
+        },
+        state: PartState::Claimed,
+        due_at: now,
+        expires_at: now + 900,
+        lease_until: now + 120,
+        lease_token: Id::new_v4(),
+        attempts: 1,
+        message_id: None,
+        priority: 4,
+    };
+    put(&mut *tx, Some(plan), &job).await.unwrap();
+    tx.commit().await.unwrap();
+    let (ui, screens, server) = ui(&f).await;
+    ui.process_job(job.clone()).await.unwrap();
+    let mut tx = f.db.begin().await.unwrap();
+    assert_eq!(
+        get::<Job>(&mut *tx, job.id).await.unwrap().state,
+        PartState::Sent
+    );
+    assert_eq!(
+        get::<Dialog>(&mut *tx, owner.id).await.unwrap().step,
+        "code"
+    );
+    let draft = get::<DraftSession>(&mut *tx, owner.id)
+        .await
+        .unwrap()
+        .dialog;
+    assert_eq!(draft.draft_id, Some(draft_id));
+    assert_eq!(draft.guardians, prompt.guardians);
+    assert_eq!(draft.step, "builder");
+    tx.commit().await.unwrap();
+    assert_eq!(
+        f.engine
+            .draft_blocks(owner.id, draft_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        screens.lock().await.len(),
+        1,
+        "Upload feedback must not replace a sensitive prompt with the draft menu"
+    );
+    let mut seq = 18000;
+    command(&ui, &mut seq, owner.telegram_id, "/start").await;
+    press(&ui, &screens, &mut seq, owner.telegram_id, "Continue draft").await;
+    assert!(labels(&last(&screens).await).contains(&"Review before saving"));
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn stale_draft_buttons_preserve_prompts_and_late_keys_never_become_content() {
+    let f = fixture().await;
+    let (owner, plan, people) = participants(&f).await;
+    f.engine.locale(owner.id, "en").await.unwrap();
+    let draft = ready_draft(&f, &owner, plan, &people).await;
+    let (ui, screens, server) = ui(&f).await;
+    let mut seq = 19000;
+    command(&ui, &mut seq, owner.telegram_id, "/start").await;
+    press(&ui, &screens, &mut seq, owner.telegram_id, "Continue draft").await;
+    let old_save = button(&last(&screens).await, "Save and encrypt");
+    press(
+        &ui,
+        &screens,
+        &mut seq,
+        owner.telegram_id,
+        "Add more blocks",
+    )
+    .await;
+    press(&ui, &screens, &mut seq, owner.telegram_id, "Text").await;
+    let mut prompt = dialog(&f, &owner).await;
+    prompt.draft_id = None;
+    prompt.step = "code".into();
+    let mut tx = f.db.begin().await.unwrap();
+    put(&mut *tx, Some(plan), &prompt).await.unwrap();
+    tx.commit().await.unwrap();
+    callback(&ui, &mut seq, owner.telegram_id, old_save).await;
+    let mut tx = f.db.begin().await.unwrap();
+    assert_eq!(
+        get::<Dialog>(&mut *tx, owner.id).await.unwrap().step,
+        "code"
+    );
+    tx.commit().await.unwrap();
+    command(&ui, &mut seq, owner.telegram_id, "/start").await;
+    press(&ui, &screens, &mut seq, owner.telegram_id, "Continue draft").await;
+    for token in ["R1.synthetic-expired-key", "  Z1.synthetic-expired-code"] {
+        command(&ui, &mut seq, owner.telegram_id, token).await;
+        assert_eq!(last(&screens).await["text"], tr("en", "stale-action"));
+    }
+    assert_eq!(
+        f.engine.draft_blocks(owner.id, draft).await.unwrap().len(),
+        1
+    );
+    let mut tx = f.db.begin().await.unwrap();
+    for message in [seq - 1, seq] {
+        let event = Id::from_u128((100_u128 << 64) | message as u128);
+        assert!(matches!(
+            get::<Job>(&mut *tx, event).await.unwrap().task,
+            Task::CleanupMessage { .. }
+        ));
+    }
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn home_guides_individually_paused_secrets_and_explains_write_hold() {
+    let f = fixture().await;
+    let (owner, plan, people) = participants(&f).await;
+    f.engine.locale(owner.id, "en").await.unwrap();
+    let (secret, _) = secret(&f, &owner, plan, &people, false).await;
+    f.engine
+        .control(owner.id, plan, Id::new_v4(), Control::Rearm)
+        .await
+        .unwrap();
+    f.engine
+        .control(
+            owner.id,
+            plan,
+            Id::new_v4(),
+            Control::StopSecret { secret_id: secret },
+        )
+        .await
+        .unwrap();
+    let (ui, screens, server) = ui(&f).await;
+    let mut seq = 20000;
+    command(&ui, &mut seq, owner.telegram_id, "/start").await;
+    assert_eq!(labels(&last(&screens).await)[0], "Secrets");
+    press(&ui, &screens, &mut seq, owner.telegram_id, "Secrets").await;
+    let first = labels(&last(&screens).await)[0].to_owned();
+    press(&ui, &screens, &mut seq, owner.telegram_id, &first).await;
+    assert!(labels(&last(&screens).await).contains(&tr("en", "resume-secret-review").as_str()));
+    assert!(!labels(&last(&screens).await).contains(&"Stop this secret"));
+    adapters::backup::set_maintenance(&f.db, true)
+        .await
+        .unwrap();
+    let (_, create) = ui
+        .button(&owner, "new-secret", None, Some(plan), true, "New secret")
+        .await
+        .unwrap();
+    callback(&ui, &mut seq, owner.telegram_id, create).await;
+    assert_eq!(last(&screens).await["text"], tr("en", "service-delayed"));
+    let mut tx = f.db.begin().await.unwrap();
+    assert!(
+        list::<Draft>(&mut *tx, Some(plan))
+            .await
+            .unwrap()
+            .iter()
+            .all(|draft| draft.saved_secret.is_some())
+    );
     server.abort();
 }

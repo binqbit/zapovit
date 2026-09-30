@@ -19,7 +19,9 @@ impl Engine {
                     put(&mut *tx, Some(secret.id), &grant).await?;
                 }
             }
-            for mut case in list::<CaseRecord>(&mut *tx, Some(secret.id)).await? {
+            for raw in tx.active_cases(secret.id).await? {
+                let mut case: CaseRecord =
+                    serde_json::from_value(raw).map_err(|_| Error::Internal)?;
                 if case.started_delivery.is_some_and(|at| now >= at + 7 * DAY)
                     && matches!(
                         case.case.state,
@@ -46,38 +48,13 @@ impl Engine {
                 }
             }
         }
-        for draft in list::<Draft>(&mut *tx, Some(plan_id)).await? {
-            if draft.expires_at <= now || draft.saved_secret.is_some() {
-                for mut object in list::<FileObject>(&mut *tx, Some(plan_id)).await? {
-                    if object.draft_id == draft.id && object.state == "draft" {
-                        object.state = "gc".into();
-                        object.due_at = now;
-                        put(&mut *tx, Some(plan_id), &object).await?;
-                    }
-                }
-                if draft.expires_at <= now {
-                    let profile: Profile = get(&mut *tx, plan.profile_id).await?;
-                    for (chat_id, message_id) in draft.sources {
-                        enqueue(
-                            &mut *tx,
-                            Some(plan_id),
-                            Task::CleanupMessage {
-                                chat_id,
-                                message_id,
-                                sent_at: draft.created_at,
-                                account_id: profile.owner_id,
-                            },
-                            now,
-                            now + DAY,
-                            1,
-                        )
-                        .await?;
-                    }
-                    tx.remove(Kind::Draft, draft.id).await?;
-                }
-            }
+        for raw in tx.expired(Kind::Draft, Some(plan_id), now, 100).await? {
+            let draft: Draft = serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+            crate::control::remove_draft(&mut *tx, &draft).await?;
         }
-        for job in list::<Job>(&mut *tx, Some(plan_id)).await? {
+
+        for raw in tx.expired(Kind::Job, Some(plan_id), now, 200).await? {
+            let job: Job = serde_json::from_value(raw).map_err(|_| Error::Internal)?;
             if job.expires_at <= now
                 && !matches!(job.state, PartState::Dispatching | PartState::Claimed)
             {
@@ -103,7 +80,8 @@ impl Engine {
                 tx.remove(Kind::Claim, claim.id).await?;
             }
         }
-        for action in list::<Action>(&mut *tx, Some(plan_id)).await? {
+        for raw in tx.expired(Kind::Action, Some(plan_id), now, 200).await? {
+            let action: Action = serde_json::from_value(raw).map_err(|_| Error::Internal)?;
             if action.expires_at <= now {
                 tx.remove(Kind::Action, action.id).await?;
             }
@@ -139,6 +117,7 @@ impl Engine {
         // Missing on the first scan does not prove an earlier request cannot complete later.
         if !exists && now > fresh.created_at + 2 * DAY {
             tx.remove(Kind::FileObject, fresh.id).await?;
+            tx.release_resource("blob_bytes", fresh.id).await?;
         } else {
             fresh.state = "gc".into();
             fresh.due_at = now + 300;

@@ -104,8 +104,8 @@ async fn slash_commands_are_limited_but_stop_and_sensitive_cleanup_still_work() 
     ui.handle(100, &update(502, 9001, "/stop")).await.unwrap();
     assert_eq!(
         requests.load(Ordering::Relaxed),
-        2,
-        "STOP confirmation bypasses the ordinary limit"
+        1,
+        "STOP durability does not wait for Telegram feedback"
     );
     let mut tx = f.engine.db.begin().await.unwrap();
     assert_eq!(
@@ -118,6 +118,10 @@ async fn slash_commands_are_limited_but_stop_and_sensitive_cleanup_still_work() 
             .unwrap()
             .is_empty()
     );
+    let notices = list::<Job>(&mut *tx, Some(plan)).await.unwrap();
+    assert!(notices.iter().any(|job| matches!(&job.task,
+        Task::Notice { key, .. } if key == "stopped")
+        && job.priority == 0));
     // Cleanup is scheduled even for an invalid token, expired dialog and full rate limit.
     put(
         &mut *tx,
@@ -135,6 +139,7 @@ async fn slash_commands_are_limited_but_stop_and_sensitive_cleanup_still_work() 
             guardians: Default::default(),
             recipients: Default::default(),
             threshold: 0,
+            timing: None,
         },
     )
     .await

@@ -104,7 +104,7 @@ impl Engine {
         if plan.state != PlanState::Active
             || plan.pending_control.is_some()
             || plan.hold_until > now
-            || !tx.operational_ready().await?
+            || !tx.operational_status(Some(plan.id)).await?.ready
         {
             return Ok(());
         }
@@ -304,6 +304,11 @@ impl Engine {
         }
         if !matches!(job.state, PartState::Queued | PartState::RetryableFailed) || job.due_at > now
         {
+            return Ok(None);
+        }
+        // Backup maintenance drains existing bounded I/O without admitting more.
+        // Protective inbox controls remain available independently of workers.
+        if !tx.writes_ready().await? {
             return Ok(None);
         }
         job.state = PartState::Claimed;
@@ -539,7 +544,7 @@ impl Engine {
                     timestamp(now)?,
                     plan.hold_until > now,
                 )
-                || !tx.operational_ready().await?
+                || !tx.operational_status(Some(plan.id)).await?.ready
             {
                 return Ok(false);
             }
@@ -732,7 +737,7 @@ impl Engine {
                 plan.hold_until > now,
             )
             || case.started_delivery.is_none_or(|at| now >= at + 7 * DAY)
-            || !tx.operational_ready().await?
+            || !tx.operational_status(Some(plan.id)).await?.ready
         {
             return Err(RuleError::AccessDenied.into());
         }

@@ -5,13 +5,14 @@ use crate::{
     telegram::{DeleteResult, Telegram, entity},
 };
 use application::*;
-use domain::{Block, CaseState, DAY, Id, Policy, RuleError, SecretState, Timing};
+use domain::{Block, CaseState, DAY, Id, PartState, Policy, RuleError, SecretState, Timing};
 use serde_json::Value;
 use teloxide_core::types::MessageEntityKind;
 use zeroize::Zeroizing;
 
 mod drafts;
 mod menus;
+mod workspace;
 use menus::Menu;
 
 #[derive(Clone)]
@@ -85,7 +86,7 @@ impl BotUi {
             epoch,
             name: name.into(),
             target,
-            expires_at: now + DAY,
+            expires_at: now + if name == "delete-confirmed" { 300 } else { DAY },
             used: false,
         };
         put(&mut *tx, plan_id, &a).await?;
@@ -132,19 +133,59 @@ impl BotUi {
             guardians: Default::default(),
             recipients: Default::default(),
             threshold: 0,
+            timing: None,
         };
-        put(&mut *tx, plan, &d).await?;
+        if d.draft_id.is_some() {
+            put(
+                &mut *tx,
+                plan,
+                &DraftSession {
+                    id: d.id,
+                    dialog: d.clone(),
+                },
+            )
+            .await?;
+        } else {
+            put(&mut *tx, plan, &d).await?;
+        }
         tx.commit().await?;
         Ok(d)
     }
     async fn store_dialog(&self, d: &Dialog) -> Result<()> {
         let mut tx = self.engine.db.begin().await?;
-        put(&mut *tx, d.plan_id, d).await?;
+        if d.draft_id.is_some() {
+            put(
+                &mut *tx,
+                d.plan_id,
+                &DraftSession {
+                    id: d.id,
+                    dialog: d.clone(),
+                },
+            )
+            .await?;
+        } else {
+            put(&mut *tx, d.plan_id, d).await?;
+        }
         tx.commit().await
     }
     async fn load_dialog(&self, a: &Account) -> Result<Dialog> {
         let mut tx = self.engine.db.begin().await?;
-        let d: Dialog = get(&mut *tx, a.id).await?;
+        let d: Dialog = if let Some(raw) = tx.get(Kind::Dialog, a.id).await? {
+            serde_json::from_value(raw).map_err(|_| Error::Internal)?
+        } else {
+            get::<DraftSession>(&mut *tx, a.id).await?.dialog
+        };
+        tx.commit().await?;
+        self.validate_dialog(d).await
+    }
+    async fn load_draft_dialog(&self, a: &Account) -> Result<Dialog> {
+        let mut tx = self.engine.db.begin().await?;
+        let session: DraftSession = get(&mut *tx, a.id).await?;
+        tx.commit().await?;
+        self.validate_dialog(session.dialog).await
+    }
+    async fn validate_dialog(&self, d: Dialog) -> Result<Dialog> {
+        let mut tx = self.engine.db.begin().await?;
         let now = tx.now().await?;
         if let Some(draft_id) = d.draft_id {
             let draft: Draft = get(&mut *tx, draft_id).await?;
@@ -185,14 +226,59 @@ impl BotUi {
             return Ok(());
         }
         let telegram_id = from["id"].as_i64().ok_or(Error::InvalidInput)?;
-        let a = self
-            .engine
-            .account(
-                telegram_id,
-                chat["id"].as_i64().ok_or(Error::InvalidInput)?,
-                from["language_code"].as_str().unwrap_or("en"),
-            )
-            .await?;
+        let chat_id = chat["id"].as_i64().ok_or(Error::InvalidInput)?;
+        let language = from["language_code"].as_str().unwrap_or("en");
+        let a = match self.engine.account(telegram_id, chat_id, language).await {
+            Ok(account) => account,
+            Err(Error::RateLimited | Error::Rule(RuleError::QuotaExceeded)) => {
+                let submission = message
+                    .and_then(|m| m["text"].as_str())
+                    .and_then(recovery_submission);
+                let recovery = if let Some((_, key)) = submission {
+                    match ArgonHasher::selector(key) {
+                        Ok(selector) => {
+                            self.engine
+                                .account_for_recovery(telegram_id, chat_id, language, selector, key)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    Err(Error::Rule(RuleError::QuotaExceeded))
+                };
+                match recovery {
+                    Ok(account) => account,
+                    Err(error)
+                        if !matches!(error, Error::Storage | Error::Internal | Error::Crypto) =>
+                    {
+                        if submission.is_some()
+                            && let Some(message_id) = message.and_then(|m| m["message_id"].as_i64())
+                        {
+                            let _ = self.telegram.delete(chat_id, message_id).await;
+                        }
+                        if self
+                            .engine
+                            .limit("admission-feedback", 20, 60)
+                            .await
+                            .is_ok()
+                        {
+                            let key = if submission.is_some() {
+                                "recovery-admission-failed"
+                            } else {
+                                "admission-full"
+                            };
+                            let _ = self
+                                .telegram
+                                .send_text(chat_id, &tr(language, key), vec![], vec![], None)
+                                .await;
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         let mut tx = self.engine.db.begin().await?;
         if tx.get(Kind::HandledEvent, event).await?.is_some() {
             return Ok(());
@@ -200,9 +286,14 @@ impl BotUi {
         tx.commit().await?;
         let result = if let Some(c) = callback {
             if let Some(id) = c["id"].as_str() {
-                self.telegram.answer_callback(id).await;
+                let (_, result) = tokio::join!(
+                    self.telegram.answer_callback(id),
+                    self.callback(&a, c, event)
+                );
+                result
+            } else {
+                self.callback(&a, c, event).await
             }
-            self.callback(&a, c, event).await
         } else {
             self.message(&a, message.ok_or(Error::InvalidInput)?, event)
                 .await
@@ -265,12 +356,47 @@ impl BotUi {
         .await?;
         tx.commit().await
     }
-    async fn callback(&self, a: &Account, c: &Value, event: Id) -> Result<()> {
+    async fn callback(&self, a: &Account, c: &Value, _event: Id) -> Result<()> {
         let id = Id::parse_str(c["data"].as_str().ok_or(Error::InvalidInput)?)
             .map_err(|_| Error::InvalidInput)?;
+        // The action or its parent can have been consumed by a committed mutation.
+        // Return the actor-bound saved outcome before checking old UI epochs.
+        match self.engine.operation_receipt(a.id, id).await {
+            Ok(_) => {
+                self.engine
+                    .limit(&format!("action:{}", a.id), 30, 60)
+                    .await?;
+                return self
+                    .history_page(a, 0, c["message"]["message_id"].as_i64())
+                    .await;
+            }
+            Err(Error::NotFound | Error::Rule(RuleError::Expired | RuleError::AccessDenied)) => {}
+            Err(error) => return Err(error),
+        }
         let mut tx = self.engine.db.begin().await?;
         let action: Action = get(&mut *tx, id).await?;
-        if action.actor_id != a.id || action.expires_at <= tx.now().await? || action.used {
+        if action.actor_id != a.id || action.expires_at <= tx.now().await? {
+            return Err(RuleError::StaleAction.into());
+        }
+        if action.name.starts_with("draft:seal:")
+            && let Some(draft) = action.target
+        {
+            tx.commit().await?;
+            match self.engine.operation_receipt(a.id, draft).await {
+                Ok(receipt) if receipt.operation == OperationKind::SecretSaved => {
+                    self.engine
+                        .limit(&format!("action:{}", a.id), 30, 60)
+                        .await?;
+                    return self
+                        .history_page(a, 0, c["message"]["message_id"].as_i64())
+                        .await;
+                }
+                Ok(_) | Err(Error::NotFound | Error::Rule(RuleError::Expired)) => {}
+                Err(error) => return Err(error),
+            }
+            tx = self.engine.db.begin().await?;
+        }
+        if action.used {
             return Err(RuleError::StaleAction.into());
         }
         if let Some(plan_id) = action.plan_id {
@@ -283,15 +409,22 @@ impl BotUi {
                 return Err(RuleError::AccessDenied.into());
             }
             // STOP/check-in are always available for the current owner, even from an old menu.
-            if !["stop", "checkin", "ack-grant", "ack-recovery", "ack-claim"]
-                .contains(&action.name.as_str())
+            if ![
+                "stop",
+                "stop-secret",
+                "checkin",
+                "ack-grant",
+                "ack-recovery",
+                "ack-claim",
+            ]
+            .contains(&action.name.as_str())
                 && action.epoch != Some(plan.epoch)
             {
                 return Err(RuleError::StaleAction.into());
             }
         }
         tx.commit().await?;
-        let priority = ["stop", "checkin"].contains(&action.name.as_str());
+        let priority = ["stop", "stop-secret", "checkin"].contains(&action.name.as_str());
         if !priority {
             self.engine
                 .limit(&format!("action:{}", a.id), 30, 60)
@@ -334,16 +467,20 @@ impl BotUi {
                 self.engine
                     .control(a.id, plan.ok_or(Error::InvalidInput)?, action.id, op)
                     .await?;
-                self.say(a, key, vec![self.nav(a, "home").await?]).await?;
+                if priority {
+                    self.control_feedback(a, plan, action.id, key).await?;
+                } else {
+                    self.menu(a, Menu::Home, menu_message).await?;
+                }
             }
             "participants" => {
-                self.participants(a, plan.ok_or(Error::InvalidInput)?)
+                self.people_page(a, plan.ok_or(Error::InvalidInput)?, 0, menu_message)
                     .await?
             }
             "invite" => {
                 let id = self
                     .engine
-                    .invite(a.id, plan.ok_or(Error::InvalidInput)?)
+                    .invite_with_id(a.id, plan.ok_or(Error::InvalidInput)?, action.id)
                     .await?;
                 self.text(
                     a,
@@ -392,7 +529,7 @@ impl BotUi {
             }
             "ack-claim" => {
                 self.engine
-                    .acknowledge_claim(a.id, target.ok_or(Error::InvalidInput)?, event)
+                    .acknowledge_claim(a.id, target.ok_or(Error::InvalidInput)?, action.id)
                     .await?;
                 self.delete_callback(a, c).await?;
                 self.say(a, "recovered", vec![]).await?;
@@ -427,7 +564,7 @@ impl BotUi {
                 });
                 self.store_dialog(&d).await?;
             }
-            "guardians" => self.guardians(a).await?,
+            "guardians" => self.inbox_page(a, 0, menu_message).await?,
             "recover" | "recoverstop" => {
                 self.dialog(a, &action.name, None, None).await?;
                 self.say(
@@ -475,44 +612,46 @@ impl BotUi {
                     .await?;
                 self.say(a, "confirmed", vec![]).await?;
             }
-            "secrets" => self.status(a, plan.ok_or(Error::InvalidInput)?).await?,
+            "secrets" => {
+                self.secrets_page(a, plan.ok_or(Error::InvalidInput)?, 0, menu_message)
+                    .await?
+            }
             "delete" => {
-                self.say(
+                let request = self
+                    .engine
+                    .prepare_deletion(a.id, plan.ok_or(Error::InvalidInput)?, target, action.id)
+                    .await?;
+                self.screen(
                     a,
-                    if target.is_some() {
-                        "delete-secret-confirm"
-                    } else {
-                        "delete-confirm"
-                    },
+                    &tr(
+                        &a.locale,
+                        if target.is_some() {
+                            "delete-secret-confirm"
+                        } else {
+                            "delete-confirm"
+                        },
+                    ),
                     vec![
-                        self.b(a, "delete-confirmed", target, plan, true).await?,
-                        self.back(
-                            a,
-                            if target.is_some() {
-                                "plan-menu"
-                            } else {
-                                "settings"
-                            },
-                        )
-                        .await?,
+                        self.b(a, "delete-confirmed", Some(request.id), plan, true)
+                            .await?,
+                        self.back(a, "home").await?,
                     ],
+                    menu_message,
                 )
                 .await?;
             }
             "delete-confirmed" => {
                 self.engine
-                    .control(
-                        a.id,
-                        plan.ok_or(Error::InvalidInput)?,
-                        action.id,
-                        target
-                            .map(|secret_id| Control::DeleteSecret { secret_id })
-                            .unwrap_or(Control::DeleteProfile),
-                    )
+                    .confirm_deletion(a.id, target.ok_or(Error::InvalidInput)?, action.id)
                     .await?;
-                self.say(a, "deleted", vec![self.nav(a, "home").await?])
-                    .await?;
+                self.say(
+                    a,
+                    "deleted",
+                    vec![self.nav(a, "history").await?, self.nav(a, "home").await?],
+                )
+                .await?;
             }
+            _ if self.workspace_callback(a, &action, menu_message).await? => {}
             _ => return Err(Error::InvalidInput),
         }
         // One-shot UI actions. Critical engine operations additionally have semantic idempotency.
@@ -566,7 +705,7 @@ impl BotUi {
             } else {
                 false
             };
-            if !emergency_owner {
+            if !emergency_owner && recovery_submission(text).is_none() {
                 self.engine
                     .limit(&format!("action:{}", a.id), 30, 60)
                     .await?;
@@ -574,13 +713,12 @@ impl BotUi {
             match command {
                 "/start" => {
                     if let Some(invite) = words.next().and_then(|w| w.strip_prefix("invite_")) {
-                        self.engine
-                            .accept_invite(
-                                a.id,
-                                Id::parse_str(invite).map_err(|_| Error::InvalidInput)?,
-                            )
-                            .await?;
-                        self.say(a, "joined", vec![]).await?;
+                        self.invitation_screen(
+                            a,
+                            Id::parse_str(invite).map_err(|_| Error::InvalidInput)?,
+                            None,
+                        )
+                        .await?;
                     } else {
                         self.home(a).await?;
                     }
@@ -593,9 +731,18 @@ impl BotUi {
                         _ => (Control::Rearm, "armed"),
                     };
                     self.engine.control(a.id, plan.id, event, op).await?;
-                    self.say(a, key, vec![]).await?;
+                    if emergency_owner {
+                        self.control_feedback(a, Some(plan.id), event, key).await?;
+                    } else {
+                        self.menu(a, Menu::Home, None).await?;
+                    }
                 }
                 "/recover" | "/recoverstop" => {
+                    if let Some((command, key)) = recovery_submission(text) {
+                        return self
+                            .recover_key(a, key, command == "/recoverstop", event)
+                            .await;
+                    }
                     self.dialog(
                         a,
                         if command == "/recover" {
@@ -611,10 +758,15 @@ impl BotUi {
                 }
                 "/guardians" => self.guardians(a).await?,
                 "/help" => {
-                    self.say(
+                    self.screen(
                         a,
-                        "help-text",
-                        vec![self.nav(a, "home").await?, self.nav(a, "settings").await?],
+                        &tr(&a.locale, "help-text"),
+                        vec![
+                            self.nav(a, "service-status").await?,
+                            self.nav(a, "privacy").await?,
+                            self.nav(a, "home").await?,
+                        ],
+                        None,
                     )
                     .await?;
                 }
@@ -627,11 +779,42 @@ impl BotUi {
             }
             return Ok(());
         }
-        self.engine
-            .limit(&format!("action:{}", a.id), 30, 60)
-            .await?;
+        if !text.starts_with("R1.") {
+            self.engine
+                .limit(&format!("action:{}", a.id), 30, 60)
+                .await?;
+        }
         let mut d = self.load_dialog(a).await?;
+        // Navigation can close a sensitive prompt while retaining a draft. A late
+        // credential reply must never become draft content or a private label.
+        if (text.trim_start().starts_with("R1.")
+            && !matches!(d.step.as_str(), "recover" | "recoverstop"))
+            || (text.trim_start().starts_with("Z1.") && d.step != "code")
+        {
+            return Err(RuleError::StaleAction.into());
+        }
         match d.step.as_str() {
+            "label" => {
+                self.engine
+                    .set_label(
+                        a.id,
+                        d.plan_id.ok_or(Error::InvalidInput)?,
+                        d.case_id.ok_or(Error::InvalidInput)?,
+                        text,
+                    )
+                    .await?;
+                self.menu(a, Menu::Home, None).await?;
+            }
+            "timezone" => {
+                let Some(offset) = workspace::parse_offset(text) else {
+                    self.say(a, "timezone-prompt", vec![self.back(a, "settings").await?])
+                        .await?;
+                    return Ok(());
+                };
+                self.engine.set_utc_offset_minutes(a.id, offset).await?;
+                self.menu(a, Menu::Settings, None).await?;
+            }
+
             "text" | "copyable" | "spoiler" => {
                 if text.is_empty() {
                     return Err(Error::InvalidInput);
@@ -665,35 +848,94 @@ impl BotUi {
                 .map_err(|_| Error::Internal)?;
                 let mut tx = self.engine.db.begin().await?;
                 let now = tx.now().await?;
-                enqueue(
+                if tx.get(Kind::Job, event).await?.is_none() {
+                    put(
+                        &mut *tx,
+                        d.plan_id,
+                        &Job {
+                            id: event,
+                            plan_id: d.plan_id,
+                            task: Task::DownloadFile {
+                                draft_id,
+                                account_id: a.id,
+                                file_id: self.engine.crypto.wrap(
+                                    "telegram-file",
+                                    draft_id,
+                                    id.as_bytes(),
+                                )?,
+                                name: self.engine.crypto.wrap(
+                                    "telegram-file-meta",
+                                    draft_id,
+                                    &metadata,
+                                )?,
+                                source_message: source.1,
+                            },
+                            state: PartState::Queued,
+                            due_at: now,
+                            expires_at: now + 900,
+                            lease_until: 0,
+                            lease_token: Id::nil(),
+                            attempts: 0,
+                            message_id: None,
+                            priority: 4,
+                        },
+                    )
+                    .await?;
+                }
+                d.step = "file-pending".into();
+                put(
                     &mut *tx,
                     d.plan_id,
-                    Task::DownloadFile {
-                        draft_id,
-                        account_id: a.id,
-                        file_id: self.engine.crypto.wrap(
-                            "telegram-file",
-                            draft_id,
-                            id.as_bytes(),
-                        )?,
-                        name: self
-                            .engine
-                            .crypto
-                            .wrap("telegram-file-meta", draft_id, &metadata)?,
-                        source_message: source.1,
+                    &DraftSession {
+                        id: d.id,
+                        dialog: d,
                     },
-                    now,
-                    now + 900,
-                    4,
                 )
                 .await?;
                 tx.commit().await?;
-                d.step = "file-pending".into();
-                self.store_dialog(&d).await?;
                 self.say(a, "file-received", vec![]).await?;
             }
             "file-pending" => {
                 self.say(a, "awaiting-file", vec![]).await?;
+            }
+            "timing-reminder" | "timing-inactivity" | "timing-wait" => {
+                let value = text.trim().parse::<i64>().ok();
+                let valid = value.is_some_and(|n| match d.step.as_str() {
+                    "timing-reminder" | "timing-wait" => (1..=30).contains(&n),
+                    _ => {
+                        (2..=365).contains(&n)
+                            && n >= 2 * d
+                                .timing
+                                .as_ref()
+                                .unwrap_or(&Timing::default())
+                                .reminder_seconds
+                                / DAY
+                    }
+                });
+                if !valid {
+                    self.say(a, "invalid-timing", vec![]).await?;
+                    self.render_draft(a, &d, None).await?;
+                    return Ok(());
+                }
+                let mut timing = d.timing.clone().unwrap_or_default();
+                let days = value.ok_or(Error::InvalidInput)?;
+                match d.step.as_str() {
+                    "timing-reminder" => {
+                        timing.reminder_seconds = days * DAY;
+                        d.step = "timing-inactivity".into();
+                    }
+                    "timing-inactivity" => {
+                        timing.inactivity_seconds = days * DAY;
+                        d.step = "timing-wait".into();
+                    }
+                    _ => {
+                        timing.release_delay_seconds = days * DAY;
+                        self.set_timing(a, &mut d, timing.clone()).await?;
+                    }
+                }
+                d.timing = Some(timing);
+                self.store_dialog(&d).await?;
+                self.render_draft(a, &d, None).await?;
             }
             "timing" => {
                 let timing = match drafts::parse_timing(text) {
@@ -714,42 +956,59 @@ impl BotUi {
                 self.engine
                     .submit_code(a.id, d.case_id.ok_or(Error::InvalidInput)?, text)
                     .await?;
-                self.say(a, "code-accepted", vec![]).await?;
-            }
-            "recover" | "recoverstop" => {
-                let selector = ArgonHasher::selector(text)?;
-                let claim = self
-                    .engine
-                    .recover(a.id, selector, text, d.step == "recoverstop", event)
-                    .await?;
+                let mut tx = self.engine.db.begin().await?;
+                tx.remove(Kind::Dialog, a.id).await?;
+                tx.commit().await?;
                 self.say(
                     a,
-                    if claim.is_some() {
-                        "recovery-pending"
-                    } else {
-                        "stopped"
-                    },
-                    vec![],
+                    "code-accepted",
+                    vec![self.nav(a, "guardians").await?, self.nav(a, "home").await?],
                 )
                 .await?;
+            }
+            "recover" | "recoverstop" => {
+                self.recover_key(a, text, d.step == "recoverstop", event)
+                    .await?;
             }
             _ => return Err(Error::InvalidInput),
         }
         Ok(())
     }
+    async fn recover_key(&self, a: &Account, key: &str, stop: bool, event: Id) -> Result<()> {
+        let selector = ArgonHasher::selector(key)?;
+        let claim = self
+            .engine
+            .recover(a.id, selector, key, stop, event)
+            .await?;
+        let mut tx = self.engine.db.begin().await?;
+        tx.remove(Kind::Dialog, a.id).await?;
+        tx.commit().await?;
+        self.control_feedback(
+            a,
+            None,
+            event,
+            if claim.is_some() {
+                "recovery-pending"
+            } else {
+                "stopped"
+            },
+        )
+        .await
+    }
     async fn cleanup_sensitive_input(&self, a: &Account, m: &Value, event: Id) -> Result<()> {
         let text = m["text"].as_str().unwrap_or("");
-        if text.starts_with('/') {
+        if text.starts_with('/') && recovery_submission(text).is_none() {
             return Ok(());
         }
         let mut tx = self.engine.db.begin().await?;
         let dialog = tx.get(Kind::Dialog, a.id).await?;
-        let sensitive = text.starts_with("R1.")
-            || text.starts_with("Z1.")
+        let sensitive = recovery_submission(text).is_some()
+            || text.trim_start().starts_with("R1.")
+            || text.trim_start().starts_with("Z1.")
             || dialog
                 .as_ref()
                 .and_then(|d| d["step"].as_str())
-                .is_some_and(|step| matches!(step, "code" | "recover" | "recoverstop"));
+                .is_some_and(|step| matches!(step, "code" | "recover" | "recoverstop" | "label"));
         if sensitive && tx.get(Kind::Job, event).await?.is_none() {
             let now = tx.now().await?;
             let job = Job {
@@ -774,43 +1033,6 @@ impl BotUi {
         }
         tx.commit().await
     }
-    async fn participants(&self, a: &Account, plan: Id) -> Result<()> {
-        let mut tx = self.engine.db.begin().await?;
-        let people = list::<Participant>(&mut *tx, Some(plan)).await?;
-        tx.commit().await?;
-        for p in people {
-            let mut tx = self.engine.db.begin().await?;
-            let person: Account = get(&mut *tx, p.account_id).await?;
-            tx.commit().await?;
-            self.text(
-                a,
-                &format!(
-                    "Telegram ID: {} · {}",
-                    person.telegram_id,
-                    if p.confirmed { "✓" } else { "—" }
-                ),
-                if p.confirmed {
-                    vec![]
-                } else {
-                    vec![
-                        self.b(a, "confirm-person", Some(p.id), Some(plan), true)
-                            .await?,
-                    ]
-                },
-            )
-            .await?;
-        }
-        self.say(
-            a,
-            "participants",
-            vec![
-                self.b(a, "invite", None, Some(plan), true).await?,
-                self.back(a, "plan-menu").await?,
-            ],
-        )
-        .await?;
-        Ok(())
-    }
     async fn track_preview(&self, a: &Account, d: &Dialog, message_id: i64) -> Result<()> {
         let mut tx = self.engine.db.begin().await?;
         let mut draft: Draft = get(&mut *tx, d.draft_id.ok_or(Error::InvalidInput)?).await?;
@@ -818,191 +1040,11 @@ impl BotUi {
         put(&mut *tx, d.plan_id, &draft).await?;
         tx.commit().await
     }
-    async fn status(&self, a: &Account, plan_id: Id) -> Result<()> {
-        let mut tx = self.engine.db.begin().await?;
-        let plan: Plan = get(&mut *tx, plan_id).await?;
-        let profile: Profile = get(&mut *tx, plan.profile_id).await?;
-        if profile.owner_id != a.id {
-            return Err(RuleError::AccessDenied.into());
-        }
-        let secrets = list::<Secret>(&mut *tx, Some(plan_id)).await?;
-        tx.commit().await?;
-        self.text(
-            a,
-            &format!(
-                "{}: {}\n{}: {}",
-                tr(&a.locale, "status"),
-                crate::localization::state(&a.locale, &plan.state),
-                tr(&a.locale, "last-checkin"),
-                drafts::display_time(plan.last_activity)
-            ),
-            vec![],
-        )
-        .await?;
-        for secret in secrets
-            .into_iter()
-            .filter(|s| s.state != SecretState::Deleted)
-        {
-            self.text(
-                a,
-                &format!(
-                    "{}\n{}\n{} / {}",
-                    secret.id,
-                    crate::localization::state(&a.locale, &secret.state),
-                    secret.policy.threshold,
-                    secret.policy.guardians.len()
-                ),
-                vec![
-                    self.b(a, "delete", Some(secret.id), Some(plan_id), true)
-                        .await?,
-                ],
-            )
-            .await?;
-        }
-        self.say(a, "secrets", vec![self.back(a, "plan-menu").await?])
-            .await?;
-        Ok(())
+    async fn status(&self, a: &Account, plan: Id) -> Result<()> {
+        self.secrets_page(a, plan, 0, None).await
     }
     async fn guardians(&self, a: &Account) -> Result<()> {
-        let mut tx = self.engine.db.begin().await?;
-        let secrets = list::<Secret>(&mut *tx, None).await?;
-        let cancellations = list::<Cancellation>(&mut *tx, None).await?;
-        tx.commit().await?;
-        let mut shown = false;
-        for secret in secrets
-            .into_iter()
-            .filter(|s| s.state != SecretState::Deleted && s.policy.guardians.contains(&a.id))
-        {
-            let mut buttons = vec![
-                self.button(
-                    a,
-                    "request-cancel",
-                    Some(secret.id),
-                    Some(secret.plan_id),
-                    false,
-                    &tr(&a.locale, "cancel-secret"),
-                )
-                .await?,
-            ];
-            buttons.push(
-                self.button(
-                    a,
-                    "request-cancel",
-                    None,
-                    Some(secret.plan_id),
-                    false,
-                    &tr(&a.locale, "cancel-plan"),
-                )
-                .await?,
-            );
-            let mut tx = self.engine.db.begin().await?;
-            let grants = list::<GuardianGrant>(&mut *tx, Some(secret.id)).await?;
-            tx.commit().await?;
-            for grant in grants
-                .into_iter()
-                .filter(|g| g.account_id == a.id && !g.ready && g.delivery.is_some())
-            {
-                buttons.push(
-                    self.b(
-                        a,
-                        "resend-code",
-                        Some(grant.id),
-                        Some(secret.plan_id),
-                        false,
-                    )
-                    .await?,
-                );
-            }
-            if let Some(case_id) = secret.last_case {
-                let mut tx = self.engine.db.begin().await?;
-                let c: CaseRecord = get(&mut *tx, case_id).await?;
-                tx.commit().await?;
-                if c.case.state == CaseState::Collecting {
-                    buttons.push(
-                        self.b(a, "submit-code", Some(case_id), Some(secret.plan_id), false)
-                            .await?,
-                    );
-                }
-            }
-            self.text(
-                a,
-                &format!(
-                    "{}: {}\n{}: {}",
-                    tr(&a.locale, "secret-reference"),
-                    secret.id,
-                    tr(&a.locale, "status"),
-                    crate::localization::state(&a.locale, &secret.state)
-                ),
-                buttons,
-            )
-            .await?;
-            shown = true;
-        }
-        for c in cancellations
-            .into_iter()
-            .filter(|c| c.state == "open" && c.members.contains(&a.id))
-        {
-            self.text(
-                a,
-                &format!(
-                    "{}\n{}: {} / {}",
-                    tr(
-                        &a.locale,
-                        if c.secret_id.is_some() {
-                            "cancel-secret"
-                        } else {
-                            "cancel-plan"
-                        }
-                    ),
-                    tr(&a.locale, "cancellation-votes"),
-                    c.votes.len(),
-                    c.members.len()
-                ),
-                vec![
-                    self.b(a, "vote-cancel", Some(c.id), Some(c.plan_id), false)
-                        .await?,
-                ],
-            )
-            .await?;
-            shown = true;
-        }
-        let mut tx = self.engine.db.begin().await?;
-        let parts = find::<DeliveryPart>(&mut *tx, "recipient_id", &a.id.to_string()).await?;
-        tx.commit().await?;
-        for part in parts.into_iter().filter(|p| {
-            matches!(
-                p.state,
-                domain::PartState::Unknown
-                    | domain::PartState::PermanentFailed
-                    | domain::PartState::RetryableFailed
-            )
-        }) {
-            let mut tx = self.engine.db.begin().await?;
-            let secret: Secret = get(&mut *tx, part.secret_id).await?;
-            tx.commit().await?;
-            self.text(
-                a,
-                &format!("{} · {}", part.secret_id, part.index + 1),
-                vec![
-                    self.b(
-                        a,
-                        "retry-delivery",
-                        Some(part.id),
-                        Some(secret.plan_id),
-                        false,
-                    )
-                    .await?,
-                ],
-            )
-            .await?;
-            shown = true;
-        }
-        if !shown {
-            self.say(a, "no-items", vec![]).await?;
-        }
-        self.say(a, "guardians", vec![self.back(a, "home").await?])
-            .await?;
-        Ok(())
+        self.inbox_page(a, 0, None).await
     }
     pub async fn process_job(&self, job: Job) -> Result<()> {
         match &job.task {
@@ -1036,19 +1078,21 @@ impl BotUi {
                     DeleteResult::Permanent => {
                         let mut tx = self.engine.db.begin().await?;
                         let now = tx.now().await?;
-                        enqueue(
-                            &mut *tx,
-                            None,
-                            Task::Notice {
-                                account_id: *account_id,
-                                key: "manual-delete".into(),
-                                buttons: vec![],
-                            },
-                            now,
-                            now + DAY,
-                            0,
-                        )
-                        .await?;
+                        if tx.get(Kind::Account, *account_id).await?.is_some() {
+                            enqueue(
+                                &mut *tx,
+                                None,
+                                Task::Notice {
+                                    account_id: *account_id,
+                                    key: "manual-delete".into(),
+                                    buttons: vec![],
+                                },
+                                now,
+                                now + DAY,
+                                0,
+                            )
+                            .await?;
+                        }
                         tx.commit().await?;
                         SendResult::Permanent
                     }
@@ -1098,16 +1142,24 @@ impl BotUi {
                         (a.chat_id, *source_message),
                     )
                     .await?;
-                let mut d = self.load_dialog(&a).await?;
-                if d.draft_id == Some(*draft_id) {
+                // Content durability must not depend on the current UI prompt.
+                self.engine
+                    .finish_job(job.id, job.lease_token, SendResult::Sent(0))
+                    .await?;
+                if let Some(mut d) = self.active_draft(&a).await?
+                    && d.draft_id == Some(*draft_id)
+                {
                     d.step = "builder".into();
                     self.store_dialog(&d).await?;
                     self.say(&a, "block-saved", vec![]).await?;
-                    self.render_draft(&a, &d, None).await?;
+                    let mut tx = self.engine.db.begin().await?;
+                    let prompt_open = tx.get(Kind::Dialog, a.id).await?.is_some();
+                    tx.commit().await?;
+                    if !prompt_open {
+                        self.render_draft(&a, &d, None).await?;
+                    }
                 }
-                self.engine
-                    .finish_job(job.id, job.lease_token, SendResult::Sent(0))
-                    .await
+                Ok(())
             }
             _ => self.send_notice_job(job).await,
         }
@@ -1247,6 +1299,12 @@ impl BotUi {
                 )
                 .await?,
             );
+        } else if matches!(&job.task, Task::Notice { .. }) {
+            match self.nav(&account, "home").await {
+                Ok(button) => buttons.push(button),
+                Err(Error::RateLimited) => {}
+                Err(error) => return Err(error),
+            }
         }
         self.telegram.reserve_send(account.chat_id).await;
         if !self
@@ -1264,4 +1322,14 @@ impl BotUi {
             .finish_job(job.id, job.lease_token, result)
             .await
     }
+}
+
+fn recovery_submission(text: &str) -> Option<(&str, &str)> {
+    let mut words = text.split_whitespace();
+    let command = words.next()?.split('@').next()?;
+    if !matches!(command, "/recover" | "/recoverstop") {
+        return None;
+    }
+    let key = words.next()?;
+    words.next().is_none().then_some((command, key))
 }

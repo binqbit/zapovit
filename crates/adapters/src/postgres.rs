@@ -1,9 +1,14 @@
-use application::{Database, Envelope, Error, Kind, Result, Transaction};
+use application::{
+    Database, Envelope, Error, Kind, OperationalBlocker, OperationalStatus, Result, Transaction,
+};
 use async_trait::async_trait;
 use domain::Id;
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, postgres::PgPoolOptions};
 use std::time::Duration;
+
+mod runtime;
+pub use runtime::{InboxClaim, InboxRoute, IngestOutcome, RoutedUpdate};
 
 #[derive(Clone)]
 pub struct PgDatabase {
@@ -14,6 +19,18 @@ impl PgDatabase {
         let pool = PgPoolOptions::new()
             .max_connections(max)
             .acquire_timeout(Duration::from_secs(10))
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    for statement in [
+                        "SET statement_timeout='10s'",
+                        "SET lock_timeout='1500ms'",
+                        "SET idle_in_transaction_session_timeout='20s'",
+                    ] {
+                        sqlx::query(statement).execute(&mut *connection).await?;
+                    }
+                    Ok(())
+                })
+            })
             .connect(url)
             .await
             .map_err(|_| Error::Storage)?;
@@ -73,7 +90,14 @@ impl PgDatabase {
                 EXISTS(SELECT 1 FROM delivery_attempts) OR
                 EXISTS(SELECT 1 FROM deletion_tombstones) OR
                 EXISTS(SELECT 1 FROM rate_limits) OR
-                EXISTS(SELECT 1 FROM audit_events)
+                EXISTS(SELECT 1 FROM audit_events) OR
+                EXISTS(SELECT 1 FROM private_metadata) OR
+                EXISTS(SELECT 1 FROM contact_states) OR
+                EXISTS(SELECT 1 FROM invitation_states) OR
+                EXISTS(SELECT 1 FROM draft_sessions) OR
+                EXISTS(SELECT 1 FROM deletion_requests) OR
+                EXISTS(SELECT 1 FROM operation_receipts) OR
+                EXISTS(SELECT 1 FROM account_preferences)
             ) AND EXISTS(SELECT 1 FROM maintenance WHERE singleton AND NOT enabled)",
         )
         .fetch_one(&self.pool)
@@ -114,6 +138,11 @@ impl PgDatabase {
         updates: &[(i64, Envelope, bool)],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(|_| Error::Storage)?;
+        sqlx::query("SELECT bot_id FROM telegram_cursor WHERE singleton AND bot_id=$1 FOR UPDATE")
+            .bind(bot)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| Error::Storage)?;
         for (id, envelope, priority) in updates {
             sqlx::query("INSERT INTO telegram_inbox(bot_id,update_id,envelope,priority) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
                 .bind(bot).bind(id).bind(sqlx::types::Json(envelope)).bind(priority).execute(&mut *tx).await.map_err(|_|Error::Storage)?;
@@ -205,7 +234,7 @@ impl PgDatabase {
             .bind(telegram_id.to_string()).fetch_one(&self.pool).await.map_err(|_|Error::Storage)
     }
     pub async fn priority_callback(&self, id: Id, telegram_id: i64) -> Result<bool> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM actions action JOIN accounts a ON action.data->>'actor_id'=a.id::text JOIN plans plan ON action.data->>'plan_id'=plan.id::text JOIN profiles p ON plan.data->>'profile_id'=p.id::text WHERE action.id=$1 AND a.data->>'telegram_id'=$2 AND action.data->>'name' IN ('stop','checkin') AND action.data->>'used'='false' AND (action.data->>'expires_at')::bigint>floor(extract(epoch from clock_timestamp()))::bigint AND p.data->>'owner_id'=a.id::text AND action.data->>'owner_epoch'=p.data->>'owner_epoch' AND p.state<>'deleted' AND plan.state<>'deleted')")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM actions action JOIN accounts a ON action.data->>'actor_id'=a.id::text JOIN plans plan ON action.data->>'plan_id'=plan.id::text JOIN profiles p ON plan.data->>'profile_id'=p.id::text WHERE action.id=$1 AND a.data->>'telegram_id'=$2 AND action.data->>'name' IN ('stop','checkin','stop-secret') AND action.data->>'used'='false' AND (action.data->>'expires_at')::bigint>floor(extract(epoch from clock_timestamp()))::bigint AND p.data->>'owner_id'=a.id::text AND action.data->>'owner_epoch'=p.data->>'owner_epoch' AND p.state<>'deleted' AND plan.state<>'deleted')")
             .bind(id).bind(telegram_id.to_string()).fetch_one(&self.pool).await.map_err(|_|Error::Storage)
     }
     pub async fn metrics(&self) -> Result<String> {
@@ -231,6 +260,7 @@ impl PgDatabase {
             self.pool.size(),
             self.pool.num_idle()
         ));
+        output.push_str(&self.runtime_metrics().await?);
         Ok(output)
     }
 }
@@ -257,8 +287,10 @@ impl Transaction for PgTransaction {
             .map_err(|_| Error::Storage)
     }
     async fn operational_ready(&mut self) -> Result<bool> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM telegram_cursor WHERE last_poll_at > clock_timestamp() - interval '120 seconds' AND last_scheduler_at > clock_timestamp() - interval '120 seconds' AND hold_until <= floor(extract(epoch from clock_timestamp()))::bigint) AND NOT EXISTS(SELECT 1 FROM telegram_inbox WHERE processed_at IS NULL) AND NOT EXISTS(SELECT 1 FROM maintenance WHERE enabled)")
-            .fetch_one(&mut *self.tx).await.map_err(|_|Error::Storage)
+        Ok(self.runtime_status(None).await?.ready)
+    }
+    async fn operational_status(&mut self, plan_id: Option<Id>) -> Result<OperationalStatus> {
+        self.runtime_status(plan_id).await
     }
     async fn now(&mut self) -> Result<i64> {
         sqlx::query_scalar("SELECT floor(extract(epoch from clock_timestamp()))::bigint")
@@ -323,6 +355,61 @@ impl Transaction for PgTransaction {
         }
         Ok(rows)
     }
+    async fn page(
+        &mut self,
+        kind: Kind,
+        scope: Option<Id>,
+        after: Option<Id>,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        let query = format!(
+            "SELECT data FROM {} WHERE ($1::uuid IS NULL OR scope_id=$1) AND ($2::uuid IS NULL OR id>$2) ORDER BY id LIMIT $3",
+            kind.table()
+        );
+        sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+            .bind(scope)
+            .bind(after)
+            .bind(limit.clamp(1, 1000))
+            .fetch_all(&mut *self.tx)
+            .await
+            .map_err(|_| Error::Storage)
+    }
+    async fn related_secrets(
+        &mut self,
+        actor: Id,
+        after: Option<Id>,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        sqlx::query_scalar("SELECT data FROM secret_versions WHERE ((data#>'{policy,guardians}') ? $1 OR (data#>'{policy,recipients}') ? $1) AND ($2::uuid IS NULL OR id>$2) AND state<>'deleted' ORDER BY id LIMIT $3")
+            .bind(actor.to_string()).bind(after).bind(limit.clamp(1,1000)).fetch_all(&mut *self.tx).await.map_err(|_|Error::Storage)
+    }
+    async fn reserve_resource(
+        &mut self,
+        resource: &str,
+        reservation_id: Id,
+        amount: i64,
+        capacity: i64,
+    ) -> Result<bool> {
+        self.reserve(resource, reservation_id, amount, capacity)
+            .await
+    }
+    async fn release_resource(&mut self, resource: &str, reservation_id: Id) -> Result<()> {
+        sqlx::query("DELETE FROM resource_reservations WHERE resource=$1 AND reservation_id=$2")
+            .bind(resource)
+            .bind(reservation_id)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(|_| Error::Storage)?;
+        Ok(())
+    }
+    async fn admit_recovery_account(
+        &mut self,
+        account: &application::Account,
+        profile_id: Id,
+        selector: Id,
+    ) -> Result<()> {
+        self.admit_recovery(account, profile_id, selector).await
+    }
     async fn due(&mut self, kind: Kind, now: i64, limit: i64) -> Result<Vec<Value>> {
         let q = format!(
             "SELECT data FROM {} WHERE due_at<=$1 ORDER BY due_at,id LIMIT $2",
@@ -335,11 +422,109 @@ impl Transaction for PgTransaction {
             .await
             .map_err(|_| Error::Storage)
     }
+    async fn expired(
+        &mut self,
+        kind: Kind,
+        scope: Option<Id>,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        let query = format!(
+            "SELECT data FROM {} WHERE ($1::uuid IS NULL OR scope_id=$1) AND (data->>'expires_at')::bigint<=$2 ORDER BY (data->>'expires_at')::bigint,id LIMIT $3",
+            kind.table()
+        );
+        sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+            .bind(scope)
+            .bind(before)
+            .bind(limit.clamp(1, 1000))
+            .fetch_all(&mut *self.tx)
+            .await
+            .map_err(|_| Error::Storage)
+    }
+    async fn active_cases(&mut self, secret: Id) -> Result<Vec<Value>> {
+        sqlx::query_scalar("SELECT data FROM release_cases WHERE scope_id=$1 AND data#>>'{case,state}' IN ('collecting','waiting','ready','delivering','partial') ORDER BY id LIMIT 2").bind(secret).fetch_all(&mut *self.tx).await.map_err(|_|Error::Storage)
+    }
     async fn put(&mut self, kind: Kind, id: Id, scope: Option<Id>, value: Value) -> Result<()> {
+        // Global admission protects public registration and unfinished work across
+        // arbitrarily many Telegram identities. Updates and emergency controls do
+        // not consume new admissions; accepted plans can still stop or delete.
+        let capacity = match kind {
+            Kind::Account => Some(100_000_i64),
+            Kind::Draft => Some(10_000),
+            Kind::Invitation => Some(100_000),
+            // Headroom is limited to critical actor-bound capabilities. Ordinary
+            // navigation cannot consume recovery ACK/deletion confirmation slots.
+            Kind::Action
+                if matches!(
+                    value["name"].as_str(),
+                    Some("ack-recovery" | "ack-claim" | "delete-confirmed")
+                ) =>
+            {
+                Some(260_000)
+            }
+            Kind::Action => Some(250_000),
+            Kind::FileObject => Some(200_000),
+            _ => None,
+        };
+        if let Some(capacity) = capacity {
+            let key = format!("admission/{}", kind.table());
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,19))")
+                .bind(key)
+                .execute(&mut *self.tx)
+                .await
+                .map_err(|_| Error::Storage)?;
+            if self.get(kind, id).await?.is_none() {
+                let count_query = format!(
+                    "SELECT count(*) FROM (SELECT id FROM {} LIMIT $1) admitted",
+                    kind.table()
+                );
+                let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_query))
+                    .bind(capacity)
+                    .fetch_one(&mut *self.tx)
+                    .await
+                    .map_err(|_| Error::Storage)?;
+                if count >= capacity {
+                    return Err(Error::RateLimited);
+                }
+            }
+        }
+        if kind == Kind::Job && self.get(kind, id).await?.is_none() {
+            // Accepted emergency controls have reserved outbox capacity. UI
+            // coalescing bounds their feedback separately from ordinary work.
+            let cleanup = matches!(
+                value["task"]["kind"].as_str(),
+                Some("cleanup_message" | "delete_object")
+            );
+            if value["priority"].as_i64().unwrap_or(1) > 0 && !cleanup {
+                sqlx::query("SELECT pg_advisory_xact_lock(734219884)")
+                    .execute(&mut *self.tx)
+                    .await
+                    .map_err(|_| Error::Storage)?;
+                let active:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT id FROM outbox WHERE state IN ('queued','claimed','dispatching','retryable_failed') AND (data->>'priority')::integer>0 AND data#>>'{task,kind}' NOT IN ('cleanup_message','delete_object') LIMIT 100000) jobs").fetch_one(&mut *self.tx).await.map_err(|_|Error::Storage)?;
+                if active >= 100_000 {
+                    return Err(Error::RateLimited);
+                }
+            }
+            if value["task"]["kind"] == "download_file" {
+                sqlx::query("SELECT pg_advisory_xact_lock(734219885)")
+                    .execute(&mut *self.tx)
+                    .await
+                    .map_err(|_| Error::Storage)?;
+                let active:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT id FROM outbox WHERE data#>>'{task,kind}'='download_file' AND state IN ('queued','claimed','dispatching','retryable_failed') LIMIT 2000) jobs").fetch_one(&mut *self.tx).await.map_err(|_|Error::Storage)?;
+                if active >= 2000 {
+                    return Err(Error::RateLimited);
+                }
+            }
+        }
+        if matches!(kind, Kind::Draft | Kind::Secret) {
+            self.reserve_payload(kind, id, value["payload"].to_string().len() as i64)
+                .await?;
+        }
         let q = format!(
             "INSERT INTO {}(id,scope_id,data) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET scope_id=EXCLUDED.scope_id,data=EXCLUDED.data,updated_at=clock_timestamp()",
             kind.table()
         );
+        let removed_plan = kind == Kind::Plan && value["state"] == "deleted";
         sqlx::query(sqlx::AssertSqlSafe(q.as_str()))
             .bind(id)
             .bind(scope)
@@ -347,6 +532,21 @@ impl Transaction for PgTransaction {
             .execute(&mut *self.tx)
             .await
             .map_err(|_| Error::Storage)?;
+        if removed_plan {
+            sqlx::query("DELETE FROM runtime_plan_schedule WHERE plan_id=$1")
+                .bind(id)
+                .execute(&mut *self.tx)
+                .await
+                .map_err(|_| Error::Storage)?;
+        } else if kind == Kind::Plan {
+            sqlx::query(
+                "INSERT INTO runtime_plan_schedule(plan_id) VALUES($1) ON CONFLICT DO NOTHING",
+            )
+            .bind(id)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(|_| Error::Storage)?;
+        }
         Ok(())
     }
     async fn remove(&mut self, kind: Kind, id: Id) -> Result<()> {
@@ -356,6 +556,17 @@ impl Transaction for PgTransaction {
             .execute(&mut *self.tx)
             .await
             .map_err(|_| Error::Storage)?;
+        if kind == Kind::Plan {
+            sqlx::query("DELETE FROM runtime_plan_schedule WHERE plan_id=$1")
+                .bind(id)
+                .execute(&mut *self.tx)
+                .await
+                .map_err(|_| Error::Storage)?;
+        }
+        if matches!(kind, Kind::Draft | Kind::Secret) {
+            self.release_resource(&format!("payload/{}", kind.table()), id)
+                .await?;
+        }
         Ok(())
     }
     async fn rate_limit(&mut self, key: &str, capacity: i64, period: i64) -> Result<bool> {

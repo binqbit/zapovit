@@ -16,6 +16,8 @@ Users interact with Zapovit through a Telegram bot.
 
 The owner decides what to pass on, who should receive it, and under which conditions. Activity confirmations and review by trusted contacts can help determine when to begin the transfer process. Recipients receive their assigned information once the configured conditions are met.
 
+The Telegram interface guides preparation one step at a time: recovery key, confirmed people, roles and timing, content, review, code acknowledgments, then activation. Home shows readiness and deadlines. Private names, separate guardian/recipient views, draft editing and scoped pause/delete controls keep additional options in the relevant card.
+
 Missed activity confirmations start a review by trusted contacts. They do not, on their own, establish that the owner is unable to manage their data.
 
 ## Development
@@ -41,3 +43,4 @@ Local diagnostic tools, synthetic databases, transcripts and reports belong in `
 - [Version 1 technical specification](docs/v1-technical-spec.md) — architecture, technology stack, encryption, storage, delivery workflows, and deployment.
 - [Running and operating Zapovit](docs/operations.md) — setup, configuration, bot usage, backups, and verification commands.
 - [Improvement roadmap](docs/roadmap.md) — repository review, priorities, and acceptance criteria for the next development stages.
+- [Public-service and Telegram UX plan](docs/production-plan.md) — agreed implementation, user journeys, reliability design, and remaining release gates.

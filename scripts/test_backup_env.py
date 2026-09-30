@@ -124,6 +124,21 @@ class CaptureTests(unittest.TestCase):
                 backup_env.docker_output(["inspect", "synthetic"])
         self.assertNotIn("secret-content", str(error.exception))
 
+    def test_metadata_pins_helpers_to_the_running_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = dict(zip(("app", "db", "object-storage"), fixtures()))
+            for index, record in enumerate(records.values()):
+                record["_ImageID"] = "sha256:" + str(index + 1) * 64
+            with patch.object(backup_env, "inspect_service", side_effect=records.__getitem__):
+                backup_env.capture(root / "runtime.env", root / "deployment.json")
+            with patch.object(backup_env.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                backup_env.run_with_runtime(root / "runtime.env", ["run", "--no-build", "app", "check-config"])
+                effective = run.call_args.kwargs["env"]
+                self.assertEqual(effective["APP_IMAGE"], records["app"]["_ImageID"])
+                self.assertEqual(effective["APP_PULL_POLICY"], "never")
+            self.assertNotIn("TELEGRAM_BOT_TOKEN", (root / "deployment.json").read_text())
+
     @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI unavailable")
     def test_compose_round_trips_special_characters_without_a_daemon(self):
         probe = subprocess.run(["docker", "compose", "version"], capture_output=True, check=False)

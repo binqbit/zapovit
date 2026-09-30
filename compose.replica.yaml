@@ -1,0 +1,8 @@
+# The operator supplies independently durable mounted storage. A second local
+# directory/volume does not provide protection against loss of the whole host.
+services:
+  app:
+    environment:
+      JOURNAL_REPLICA_DIR: /var/lib/zapovit/replica
+    volumes:
+      - ${JOURNAL_REPLICA_PATH:?Set the independently durable mounted directory}:/var/lib/zapovit/replica

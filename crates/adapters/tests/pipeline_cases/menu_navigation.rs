@@ -96,11 +96,12 @@ async fn menus_group_settings_localize_and_preserve_owner_controls() {
     assert_eq!(
         labels(&last(&screens).await),
         [
-            "Confirm activity",
-            "My plan",
-            "Guardian requests",
+            "Access and recovery",
+            "Secrets · 0",
+            "People · 0",
+            "Inbox",
             "Settings",
-            "STOP transmission"
+            "Stop all transmissions"
         ]
     );
     press(&ui, &screens, &mut seq, 7101, "Settings").await;
@@ -108,8 +109,11 @@ async fn menus_group_settings_localize_and_preserve_owner_controls() {
         labels(&last(&screens).await),
         [
             "Language",
+            "Time display",
             "Access and recovery",
-            "Delete permanently",
+            "Activity history",
+            "Help",
+            "Delete profile and my secrets",
             "← Back"
         ]
     );
@@ -126,30 +130,30 @@ async fn menus_group_settings_localize_and_preserve_owner_controls() {
     press(&ui, &screens, &mut seq, 7101, "← Назад").await;
     assert_eq!(last(&screens).await["text"], "Налаштування");
     press(&ui, &screens, &mut seq, 7101, "← Назад").await;
-    press(&ui, &screens, &mut seq, 7101, "Мій план").await;
-    assert_eq!(
-        labels(&last(&screens).await),
-        [
-            "Секрети та статус",
-            "Новий секрет",
-            "Довірені люди",
-            "Активувати план",
-            "← Назад"
-        ]
-    );
-    press(&ui, &screens, &mut seq, 7101, "← Назад").await;
-    press(&ui, &screens, &mut seq, 7101, "STOP передачі").await;
+    let home = last(&screens).await;
+    assert!(labels(&home).contains(&"Секрети · 0"));
+    let rows = home["reply_markup"]["inline_keyboard"].as_array().unwrap();
+    assert!(rows.iter().all(|row| row.as_array().unwrap().len() <= 2));
+    assert_eq!(rows.last().unwrap()[0]["style"], "danger");
+    press(&ui, &screens, &mut seq, 7101, "Зупинити всі передачі").await;
     assert_eq!(
         f.engine.own_plan(owner.id).await.unwrap().1.state,
         PlanState::Paused
     );
-    press(&ui, &screens, &mut seq, 7101, "Головне меню").await;
+    command(&ui, &mut seq, 7101, "/start").await;
     press(&ui, &screens, &mut seq, 7101, "Налаштування").await;
     press(&ui, &screens, &mut seq, 7101, "Доступ і відновлення").await;
     assert!(labels(&last(&screens).await).contains(&"Замінити ключ відновлення"));
     press(&ui, &screens, &mut seq, 7101, "← Назад").await;
-    let delete = button(&last(&screens).await, "Видалити назавжди");
-    press(&ui, &screens, &mut seq, 7101, "Видалити назавжди").await;
+    let delete = button(&last(&screens).await, "Видалити профіль та мої секрети");
+    press(
+        &ui,
+        &screens,
+        &mut seq,
+        7101,
+        "Видалити профіль та мої секрети",
+    )
+    .await;
     assert!(labels(&last(&screens).await).contains(&"Так, видалити назавжди"));
     press(&ui, &screens, &mut seq, 7101, "← Назад").await;
     assert_eq!(f.engine.own_plan(owner.id).await.unwrap().1.id, plan);
@@ -158,7 +162,14 @@ async fn menus_group_settings_localize_and_preserve_owner_controls() {
     command(&ui, &mut seq, 7102, "/settings").await;
     assert_eq!(
         labels(&last(&screens).await),
-        ["Language", "Access and recovery", "← Back"]
+        [
+            "Language",
+            "Time display",
+            "Access and recovery",
+            "Activity history",
+            "Help",
+            "← Back"
+        ]
     );
     press(&ui, &screens, &mut seq, 7102, "Access and recovery").await;
     assert!(!labels(&last(&screens).await).contains(&"Replace recovery key"));

@@ -10,6 +10,8 @@ use zeroize::Zeroizing;
 pub struct Settings {
     pub data_mode: String,
     pub journal_dir: PathBuf,
+    #[serde(default)]
+    pub journal_replica_dir: Option<PathBuf>,
     pub s3_endpoint: String,
     pub s3_region: String,
     pub s3_bucket: String,
@@ -41,6 +43,11 @@ impl Settings {
         // Read only supported settings; unrelated process and Compose variables
         // must not become application configuration fields.
         let mut builder = config::Config::builder();
+        if let Some(path) = read("JOURNAL_REPLICA_DIR")?.filter(|value| !value.is_empty()) {
+            builder = builder
+                .set_override("journal_replica_dir", path)
+                .map_err(|_| Error::Config)?;
+        }
         for (name, default) in [
             ("DATA_MODE", "production"),
             ("JOURNAL_DIR", "/var/lib/zapovit/journal"),

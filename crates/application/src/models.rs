@@ -191,6 +191,8 @@ pub struct Dialog {
     pub recipients: BTreeSet<Id>,
     #[serde(default)]
     pub threshold: u8,
+    #[serde(default)]
+    pub timing: Option<Timing>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -204,6 +206,93 @@ pub struct Action {
     pub target: Option<Id>,
     pub expires_at: i64,
     pub used: bool,
+}
+
+/// Owner-readable names are separate from the immutable sealed payload.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PrivateMetadata {
+    pub id: Id,
+    pub plan_id: Id,
+    pub label: Envelope,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ContactState {
+    pub id: Id,
+    pub plan_id: Id,
+    pub archived: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct InvitationState {
+    pub id: Id,
+    pub plan_id: Id,
+    pub revoked: bool,
+    pub declined: BTreeSet<Id>,
+}
+
+/// Long-lived preparation and short-lived draft UI do not overwrite code prompts.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DraftSession {
+    pub id: Id,
+    pub dialog: Dialog,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AccountPreference {
+    pub id: Id,
+    pub utc_offset_minutes: i16,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DeletionRequest {
+    pub id: Id,
+    pub actor_id: Id,
+    pub plan_id: Id,
+    pub secret_id: Option<Id>,
+    pub owner_epoch: i64,
+    pub plan_epoch: i64,
+    pub secret_epoch: Option<i64>,
+    pub expires_at: i64,
+    pub completed_operation: Option<Id>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    CheckIn,
+    Stop,
+    Resume,
+    StopSecret,
+    ResumeSecret,
+    DeleteSecret,
+    DeletePlan,
+    DeleteProfile,
+    RecoveryStarted,
+    RecoveryCompleted,
+    SecretSaved,
+    DraftCancelled,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptStatus {
+    Completed,
+    CleanupPending,
+}
+
+/// Bounded user-visible history contains identifiers and outcomes, never content.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OperationReceipt {
+    pub id: Id,
+    pub actor_id: Id,
+    pub plan_id: Option<Id>,
+    pub secret_id: Option<Id>,
+    pub operation: OperationKind,
+    pub status: ReceiptStatus,
+    pub at: i64,
+    pub due_at: i64,
+    pub pending_objects: BTreeSet<Id>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -274,6 +363,9 @@ pub enum Control {
     Stop,
     Rearm,
     StopSecret {
+        secret_id: Id,
+    },
+    RearmSecret {
         secret_id: Id,
     },
     DeletePlan,
@@ -361,6 +453,13 @@ pub enum Kind {
     HandledEvent,
     Attempt,
     DeletionTombstone,
+    PrivateMetadata,
+    ContactState,
+    InvitationState,
+    DraftSession,
+    DeletionRequest,
+    OperationReceipt,
+    AccountPreference,
 }
 
 impl Kind {
@@ -387,6 +486,13 @@ impl Kind {
             Self::HandledEvent => "handled_events",
             Self::Attempt => "delivery_attempts",
             Self::DeletionTombstone => "deletion_tombstones",
+            Self::PrivateMetadata => "private_metadata",
+            Self::ContactState => "contact_states",
+            Self::InvitationState => "invitation_states",
+            Self::DraftSession => "draft_sessions",
+            Self::DeletionRequest => "deletion_requests",
+            Self::OperationReceipt => "operation_receipts",
+            Self::AccountPreference => "account_preferences",
         }
     }
 }
@@ -405,4 +511,7 @@ record!(Account=>Account, Profile=>Profile, Plan=>Plan, Participant=>Participant
     Draft=>Draft, Secret=>Secret, GuardianGrant=>GuardianGrant, CaseRecord=>Case, Submission=>Submission,
     FileObject=>FileObject, DeliveryPart=>DeliveryPart, Claim=>Claim, Cancellation=>Cancellation,
     Dialog=>Dialog, Action=>Action, Job=>Job, ControlIntent=>ControlIntent, HandledEvent=>HandledEvent, Attempt=>Attempt,
-    DeletionTombstone=>DeletionTombstone);
+    DeletionTombstone=>DeletionTombstone, PrivateMetadata=>PrivateMetadata,
+    ContactState=>ContactState, InvitationState=>InvitationState, DraftSession=>DraftSession,
+    DeletionRequest=>DeletionRequest, OperationReceipt=>OperationReceipt,
+    AccountPreference=>AccountPreference);
