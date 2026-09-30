@@ -709,3 +709,6 @@ async fn delete_profile_purges_provisioning_and_recovery_credentials() {
 
 #[path = "pipeline_cases/engine_validation.rs"]
 mod engine_validation;
+
+#[path = "pipeline_cases/late_delivery.rs"]
+mod late_delivery;

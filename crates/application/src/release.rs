@@ -651,14 +651,31 @@ impl Engine {
         {
             let mut part: DeliveryPart =
                 serde_json::from_value(raw).map_err(|_| Error::Internal)?;
-            if part.last_attempt == Some(token) {
+            let current_attempt = part.last_attempt == Some(token);
+            if current_attempt {
                 part.state = state;
                 put(&mut *tx, Some(part.secret_id), &part).await?;
             }
             let all = list::<DeliveryPart>(&mut *tx, Some(part.secret_id)).await?;
-            if matches!(state, PartState::Unknown | PartState::PermanentFailed) {
-                let mut secret: Secret = get(&mut *tx, part.secret_id).await?;
-                if secret.state != SecretState::Deleted {
+            let mut secret: Secret = get(&mut *tx, part.secret_id).await?;
+            let mut c: CaseRecord = get(&mut *tx, case_id).await?;
+            let plan: Plan = get(&mut *tx, secret.plan_id).await?;
+            // A late HTTP result remains delivery evidence, but cannot change a
+            // stopped scope, a newer case, or a superseding delivery attempt.
+            let current_release = current_attempt
+                && secret.last_case == Some(case_id)
+                && secret.pending_control.is_none()
+                && plan.pending_control.is_none()
+                && plan.state == PlanState::Active
+                && c.case.plan_epoch == plan.epoch
+                && c.case.secret_epoch == secret.epoch
+                && matches!(c.case.state, CaseState::Delivering | CaseState::Partial)
+                && matches!(
+                    secret.state,
+                    SecretState::Armed | SecretState::Partial | SecretState::NeedsAttention
+                );
+            if current_release {
+                if matches!(state, PartState::Unknown | PartState::PermanentFailed) {
                     secret.state = if all.iter().any(|p| p.state == PartState::Sent) {
                         SecretState::Partial
                     } else {
@@ -674,16 +691,14 @@ impl Engine {
                     )
                     .await?;
                 }
-            }
-            if all.iter().all(|p| p.state == PartState::Sent) {
-                let mut secret: Secret = get(&mut *tx, part.secret_id).await?;
-                secret.state = SecretState::Delivered;
-                put(&mut *tx, Some(secret.plan_id), &secret).await?;
-                let mut c: CaseRecord = get(&mut *tx, case_id).await?;
-                c.case.state = CaseState::Complete;
-                put(&mut *tx, Some(secret.id), &c).await?;
-                for sub in list::<Submission>(&mut *tx, Some(case_id)).await? {
-                    tx.remove(Kind::Submission, sub.id).await?;
+                if all.iter().all(|p| p.state == PartState::Sent) {
+                    secret.state = SecretState::Delivered;
+                    put(&mut *tx, Some(secret.plan_id), &secret).await?;
+                    c.case.state = CaseState::Complete;
+                    put(&mut *tx, Some(secret.id), &c).await?;
+                    for sub in list::<Submission>(&mut *tx, Some(case_id)).await? {
+                        tx.remove(Kind::Submission, sub.id).await?;
+                    }
                 }
             }
         }
