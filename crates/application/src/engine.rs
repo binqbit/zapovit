@@ -149,6 +149,7 @@ impl Engine {
                 "en"
             }
             .into(),
+            display: None,
         };
         put(&mut *tx, None, &account).await?;
         tx.commit().await?;
@@ -221,6 +222,7 @@ impl Engine {
                 "en"
             }
             .into(),
+            display: None,
         };
         tx.admit_recovery_account(&account, profile.id, selector)
             .await?;

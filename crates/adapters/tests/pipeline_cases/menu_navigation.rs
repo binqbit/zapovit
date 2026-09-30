@@ -67,7 +67,7 @@ async fn menus_group_settings_localize_and_preserve_owner_controls() {
         let screens = captured.clone();
         let rejected = rejected.clone();
         async move {
-            if method == "answerCallbackQuery" {
+            if matches!(method.as_str(), "answerCallbackQuery" | "editMessageReplyMarkup") {
                 return Json(json!({"ok":true,"result":true}));
             }
             assert!(matches!(method.as_str(), "sendMessage" | "editMessageText"));
@@ -93,21 +93,23 @@ async fn menus_group_settings_localize_and_preserve_owner_controls() {
     };
     let mut seq = 9000;
     command(&ui, &mut seq, 7101, "/start").await;
+    command(
+        &ui,
+        &mut seq,
+        7101,
+        &adapters::localization::tr("en", "nav-home"),
+    )
+    .await;
     assert_eq!(
         labels(&last(&screens).await),
-        [
-            "Access and recovery",
-            "Secrets · 0",
-            "People · 0",
-            "Inbox",
-            "Settings",
-            "Stop all transmissions"
-        ]
+        ["Access and recovery", "Settings", "Stop all transmissions"]
     );
     press(&ui, &screens, &mut seq, 7101, "Settings").await;
     assert_eq!(
         labels(&last(&screens).await),
         [
+            "People",
+            "Secrets",
             "Language",
             "Time display",
             "Access and recovery",
@@ -131,11 +133,16 @@ async fn menus_group_settings_localize_and_preserve_owner_controls() {
     assert_eq!(last(&screens).await["text"], "Налаштування");
     press(&ui, &screens, &mut seq, 7101, "← Назад").await;
     let home = last(&screens).await;
-    assert!(labels(&home).contains(&"Секрети · 0"));
+    assert_eq!(labels(&home).len(), 3);
     let rows = home["reply_markup"]["inline_keyboard"].as_array().unwrap();
     assert!(rows.iter().all(|row| row.as_array().unwrap().len() <= 2));
     assert_eq!(rows.last().unwrap()[0]["style"], "danger");
     press(&ui, &screens, &mut seq, 7101, "Зупинити всі передачі").await;
+    assert_eq!(
+        f.engine.own_plan(owner.id).await.unwrap().1.state,
+        PlanState::Setup
+    );
+    press(&ui, &screens, &mut seq, 7101, "Так, зупинити").await;
     assert_eq!(
         f.engine.own_plan(owner.id).await.unwrap().1.state,
         PlanState::Paused

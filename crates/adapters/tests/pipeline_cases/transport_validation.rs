@@ -72,7 +72,11 @@ async fn unavailable_ui_replies_do_not_poison_the_shared_inbox() {
         // An uncertain UI send is not automatically sent again on replay.
         ui.handle(100, &update).await.unwrap();
     }
-    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        4,
+        "each first start sends keyboard and home once; replay sends neither"
+    );
     assert!(!f.db.has_backlog().await.unwrap());
     server.abort();
 }
@@ -104,19 +108,31 @@ async fn slash_commands_are_limited_but_stop_and_sensitive_cleanup_still_work() 
     ui.handle(100, &update(502, 9001, "/stop")).await.unwrap();
     assert_eq!(
         requests.load(Ordering::Relaxed),
-        1,
-        "STOP durability does not wait for Telegram feedback"
+        2,
+        "STOP opens a confirmation even when ordinary action quota is full"
+    );
+    let mut tx = f.engine.db.begin().await.unwrap();
+    assert_eq!(
+        get::<Plan>(&mut *tx, plan).await.unwrap().state,
+        PlanState::Setup
+    );
+    let confirmation = list::<Action>(&mut *tx, Some(plan))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|action| action.name == "stop-confirmed")
+        .unwrap();
+    tx.commit().await.unwrap();
+    ui.handle(100, &json!({"update_id":506,"callback_query":{"id":"stop-confirmation","from":{"id":9001,"is_bot":false},"data":confirmation.id.to_string(),"message":{"message_id":42,"chat":{"id":9001,"type":"private"}}}})).await.unwrap();
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        2,
+        "confirmed STOP durability does not wait for Telegram feedback"
     );
     let mut tx = f.engine.db.begin().await.unwrap();
     assert_eq!(
         get::<Plan>(&mut *tx, plan).await.unwrap().state,
         PlanState::Paused
-    );
-    assert!(
-        list::<Action>(&mut *tx, Some(plan))
-            .await
-            .unwrap()
-            .is_empty()
     );
     let notices = list::<Job>(&mut *tx, Some(plan)).await.unwrap();
     assert!(notices.iter().any(|job| matches!(&job.task,

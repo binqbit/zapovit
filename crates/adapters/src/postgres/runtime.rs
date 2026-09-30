@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-const ACTION_ROUTE_SQL: &str = "SELECT action.data->>'plan_id' AS plan,action.data->>'name' AS name,COALESCE(profile.data->>'owner_id'=$2 AND action.data->>'owner_epoch'=profile.data->>'owner_epoch',false) AS current_owner FROM actions action LEFT JOIN plans plan ON action.data->>'plan_id'=plan.id::text LEFT JOIN profiles profile ON plan.data->>'profile_id'=profile.id::text WHERE action.id=$1 AND action.data->>'actor_id'=$2 AND action.data->>'used'='false' AND (action.data->>'expires_at')::bigint>floor(extract(epoch from clock_timestamp()))::bigint AND (action.data->>'plan_id' IS NULL OR (plan.state<>'deleted' AND profile.state<>'deleted' AND (action.data->>'owner_epoch' IS NULL OR (action.data->>'owner_epoch'=profile.data->>'owner_epoch' AND profile.data->>'owner_id'=$2)) AND (action.data->>'name' IN ('stop','stop-secret','checkin','ack-grant','ack-recovery','ack-claim') OR action.data->>'epoch'=plan.data->>'epoch')))";
+const ACTION_ROUTE_SQL: &str = "SELECT action.data->>'plan_id' AS plan,action.data->>'name' AS name,COALESCE(profile.data->>'owner_id'=$2 AND action.data->>'owner_epoch'=profile.data->>'owner_epoch',false) AS current_owner FROM actions action LEFT JOIN plans plan ON action.data->>'plan_id'=plan.id::text LEFT JOIN profiles profile ON plan.data->>'profile_id'=profile.id::text WHERE action.id=$1 AND action.data->>'actor_id'=$2 AND action.data->>'used'='false' AND (action.data->>'expires_at')::bigint>floor(extract(epoch from clock_timestamp()))::bigint AND (action.data->>'plan_id' IS NULL OR (plan.state<>'deleted' AND profile.state<>'deleted' AND (action.data->>'owner_epoch' IS NULL OR (action.data->>'owner_epoch'=profile.data->>'owner_epoch' AND profile.data->>'owner_id'=$2)) AND (action.data->>'name' IN ('stop','stop-secret','stop-confirmed','stop-secret-confirmed','stop-cancel','checkin','ack-grant','ack-recovery','ack-claim') OR action.data->>'epoch'=plan.data->>'epoch')))";
 
 #[derive(Clone, Default)]
 pub struct InboxRoute {
@@ -285,10 +285,17 @@ impl PgDatabase {
                     .map_err(|_| Error::Storage)?;
                 if let Some(row) = row {
                     let name: String = row.try_get("name").map_err(|_| Error::Storage)?;
-                    route.priority = matches!(name.as_str(), "stop" | "stop-secret" | "checkin")
-                        && row
-                            .try_get::<bool, _>("current_owner")
-                            .map_err(|_| Error::Storage)?;
+                    route.priority = matches!(
+                        name.as_str(),
+                        "stop"
+                            | "stop-secret"
+                            | "stop-confirmed"
+                            | "stop-secret-confirmed"
+                            | "stop-cancel"
+                            | "checkin"
+                    ) && row
+                        .try_get::<bool, _>("current_owner")
+                        .map_err(|_| Error::Storage)?;
                 } else {
                     route.priority = false;
                     route.protective = false;

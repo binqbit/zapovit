@@ -2,6 +2,27 @@
 //! is bound to the draft, visible step, and content/policy revision it represents.
 use super::*;
 
+const PEOPLE_PER_PAGE: usize = 6;
+
+fn selection_step(step: &str) -> Option<(&str, usize)> {
+    let (role, page) = step
+        .split_once(".page.")
+        .map_or(Some((step, 0)), |(role, page)| {
+            page.parse::<usize>().ok().map(|page| (role, page))
+        })?;
+    matches!(role, "guardians" | "recipients").then_some((role, page))
+}
+
+fn person_name(person: &ContactView) -> String {
+    workspace::short_label(
+        &person
+            .label
+            .clone()
+            .or_else(|| person.display_name.clone())
+            .unwrap_or_else(|| person.telegram_id.to_string()),
+    )
+}
+
 pub(super) fn parse_timing(text: &str) -> Option<Timing> {
     let days: Vec<i64> = text
         .split_whitespace()
@@ -94,12 +115,16 @@ impl BotUi {
                 .filter(|p| p.id == plan)
                 .ok_or(RuleError::AccessDenied)?;
             if !owned.can_create_draft {
+                if owned.pending_claim.is_none() {
+                    if !owned.recovery_saved {
+                        return self.setup_recovery(a, plan).await;
+                    }
+                    if owned.confirmed_people == 0 {
+                        return self.setup_people(a, plan, None).await;
+                    }
+                }
                 let (destination, explanation) = if owned.pending_claim.is_some() {
                     ("recovery-options", "recovery-pending-guidance")
-                } else if !owned.recovery_saved {
-                    ("recovery-options", "prepare-before-content")
-                } else if owned.confirmed_people == 0 {
-                    ("participants", "prepare-before-content")
                 } else if !owned.operational.writes_ready {
                     ("home", "service-delayed")
                 } else {
@@ -132,13 +157,19 @@ impl BotUi {
                     d.guardians = policy.guardians;
                     d.recipients = policy.recipients;
                     d.threshold = policy.threshold;
-                    d.step = "ready".into();
+                    d.timing = Some(policy.timing);
+                    d.step = if self.engine.draft_blocks(a.id, draft_id).await?.is_empty() {
+                        "builder"
+                    } else {
+                        "ready"
+                    }
+                    .into();
                     self.store_dialog(&d).await?;
                 }
                 d
             }
         };
-        self.render_draft(a, &d, message).await
+        self.render_draft(a, &d, None).await
     }
 
     pub(super) async fn draft_callback(
@@ -164,16 +195,39 @@ impl BotUi {
             || action.plan_id != d.plan_id
             || step != d.step
             || revision.parse::<i64>().ok() != Some(draft.revision)
+            || (verb != "continue" && (message.is_none() || message != d.reply_to))
         {
             return Err(RuleError::StaleAction.into());
         }
         // Only a valid return to this draft cancels a separate sensitive prompt.
         tx.remove(Kind::Dialog, a.id).await?;
         tx.commit().await?;
+        let previous_step = d.step.clone();
         match verb {
             "continue" => {}
+            "invite" if selection_step(&d.step).is_some() => {
+                self.setup_people(a, d.plan_id.ok_or(Error::InvalidInput)?, None)
+                    .await?;
+                let mut tx = self.engine.db.begin().await?;
+                tx.lock(Kind::DraftSession, a.id).await?;
+                let mut current: DraftSession = get(&mut *tx, a.id).await?;
+                if current.dialog.draft_id == d.draft_id
+                    && current.dialog.step == d.step
+                    && current.dialog.reply_to == d.reply_to
+                {
+                    // No draft question is active while adding a person. Only
+                    // an explicit continuation may issue a new bound question.
+                    current.dialog.reply_to = None;
+                    put(&mut *tx, current.dialog.plan_id, &current).await?;
+                }
+                tx.commit().await?;
+                if let Some(previous) = d.reply_to {
+                    let _ = self.telegram.clear_menu(a.chat_id, previous).await;
+                }
+                return Ok(());
+            }
             "text" | "copyable" | "spoiler" | "file"
-                if matches!(d.step.as_str(), "builder" | "formatting") =>
+                if matches!(d.step.as_str(), "builder" | "formatting" | "options") =>
             {
                 d.step = verb.into()
             }
@@ -184,29 +238,61 @@ impl BotUi {
                         | "copyable"
                         | "spoiler"
                         | "file"
-                        | "guardians"
                         | "ready"
                         | "blocks"
                         | "formatting"
-                        | "discard"
+                        | "options"
+                        | "threshold"
                 ) =>
             {
                 d.step = "builder".into()
             }
-            "guardians" if matches!(d.step.as_str(), "builder" | "ready" | "recipients") => {
-                if d.step == "recipients" {
+            "guardians"
+                if matches!(d.step.as_str(), "options" | "ready")
+                    || selection_step(&d.step).is_some_and(|(role, _)| role == "recipients") =>
+            {
+                if selection_step(&d.step).is_some_and(|(role, _)| role == "recipients") {
                     d.recipients = d.selected.clone();
                 }
                 d.step = "guardians".into();
                 d.selected = d.guardians.clone();
             }
-            "recipients" if d.step == "threshold" => {
+            "recipients" if matches!(d.step.as_str(), "builder" | "threshold") => {
                 d.step = "recipients".into();
                 d.selected = d.recipients.clone();
             }
-            "threshold" if d.step.starts_with("timing") => d.step = "threshold".into(),
+            "threshold" if matches!(d.step.as_str(), "builder" | "timing-choice" | "timing") => {
+                if self.engine.draft_blocks(a.id, draft.id).await?.is_empty() {
+                    return Err(RuleError::NotReady.into());
+                }
+                d.step = "threshold".into()
+            }
+            "timing-choice" if d.step == "timing-reminder" => d.step = "timing-choice".into(),
+            "timing-reminder" if d.step == "timing-inactivity" => d.step = "timing-reminder".into(),
+            "timing-inactivity" if d.step == "timing-wait" => d.step = "timing-inactivity".into(),
+            name if name.starts_with("page.") && selection_step(&d.step).is_some() => {
+                let (role, _) = selection_step(&d.step).ok_or(RuleError::StaleAction)?;
+                let page = name[5..]
+                    .parse::<usize>()
+                    .map_err(|_| Error::InvalidInput)?;
+                let count = self
+                    .engine
+                    .contacts(a.id, d.plan_id.ok_or(Error::InvalidInput)?)
+                    .await?
+                    .into_iter()
+                    .filter(|p| p.confirmed && !p.archived)
+                    .count();
+                if page > count.saturating_sub(1) / PEOPLE_PER_PAGE {
+                    return Err(RuleError::StaleAction.into());
+                }
+                d.step = if page == 0 {
+                    role.to_owned()
+                } else {
+                    format!("{role}.page.{page}")
+                };
+            }
             name if (name.starts_with("select.") || name.starts_with("unselect."))
-                && matches!(d.step.as_str(), "guardians" | "recipients") =>
+                && selection_step(&d.step).is_some() =>
             {
                 let (verb, person) = name.split_once('.').ok_or(Error::InvalidInput)?;
                 let person = Id::parse_str(person).map_err(|_| Error::InvalidInput)?;
@@ -229,24 +315,24 @@ impl BotUi {
                     }
                     d.selected.insert(person);
                 }
-                if d.step == "guardians" {
+                if selection_step(&d.step).is_some_and(|(role, _)| role == "guardians") {
                     d.guardians = d.selected.clone();
                 } else {
                     d.recipients = d.selected.clone();
                 }
             }
-            "done" if matches!(d.step.as_str(), "guardians" | "recipients") => {
+            "done" if selection_step(&d.step).is_some() => {
                 if d.selected.is_empty() {
                     self.say(a, "select-person-first", vec![]).await?;
                     return self.render_draft(a, &d, message).await;
                 }
-                if d.step == "guardians" {
+                if selection_step(&d.step).is_some_and(|(role, _)| role == "guardians") {
                     d.guardians = d.selected.clone();
                     d.selected = d.recipients.clone();
                     d.step = "recipients".into();
                 } else {
                     d.recipients = d.selected.clone();
-                    d.step = "threshold".into();
+                    d.step = "builder".into();
                 }
             }
             name if name.starts_with("threshold.") && d.step == "threshold" => {
@@ -260,12 +346,23 @@ impl BotUi {
             "timing-default" if d.step.starts_with("timing") => {
                 self.set_timing(a, &mut d, Timing::default()).await?;
             }
-            "timing-custom" if d.step == "timing-choice" => {
-                d.timing = Some(Timing::default());
+            "timing-custom" if matches!(d.step.as_str(), "timing-choice" | "timing") => {
+                d.timing.get_or_insert_with(Timing::default);
                 d.step = "timing-reminder".into();
             }
-            "formatting" if d.step == "builder" => d.step = "formatting".into(),
-            "blocks" if d.step == "builder" || d.step.starts_with("block.") => {
+            "options"
+                if matches!(
+                    d.step.as_str(),
+                    "builder" | "formatting" | "blocks" | "discard" | "text" | "file"
+                ) || (selection_step(&d.step).is_some_and(|(role, _)| role == "guardians")
+                    && draft.policy.is_some()) =>
+            {
+                d.step = "options".into()
+            }
+            "formatting" if matches!(d.step.as_str(), "options" | "copyable" | "spoiler") => {
+                d.step = "formatting".into()
+            }
+            "blocks" if d.step == "options" || d.step.starts_with("block.") => {
                 d.step = "blocks".into()
             }
             name if name.starts_with("block.") && d.step == "blocks" => {
@@ -309,25 +406,32 @@ impl BotUi {
                 }
                 d.step = "ready".into();
             }
-            "discard" => d.step = "discard".into(),
+            "discard" if d.step == "options" => d.step = "discard".into(),
             "discard-confirmed" if d.step == "discard" => {
                 self.engine
                     .cancel_draft(a.id, draft.id, draft.revision)
                     .await?;
-                return self.menu(a, Menu::Home, message).await;
+                self.menu(a, Menu::Home, None).await?;
+                if let Some(previous) = d.reply_to {
+                    let _ = self.telegram.clear_menu(a.chat_id, previous).await;
+                }
+                return Ok(());
             }
-            "name" if d.step == "builder" || d.step == "ready" => {
+            "name" if d.step == "options" => {
                 let mut prompt = self.dialog(a, "label", d.plan_id, None).await?;
                 prompt.case_id = Some(draft.id);
                 self.store_dialog(&prompt).await?;
-                return self
-                    .screen(
-                        a,
-                        &tr(&a.locale, "label-prompt"),
-                        vec![self.nav(a, "home").await?],
-                        message,
-                    )
-                    .await;
+                self.screen(
+                    a,
+                    &tr(&a.locale, "label-prompt"),
+                    vec![self.draft_button(a, &d, "continue", "back").await?],
+                    None,
+                )
+                .await?;
+                if let Some(previous) = d.reply_to {
+                    let _ = self.telegram.clear_menu(a.chat_id, previous).await;
+                }
+                return Ok(());
             }
             "preview" if d.step == "ready" => {
                 let blocks = self.engine.draft_blocks(a.id, draft.id).await?;
@@ -354,14 +458,30 @@ impl BotUi {
                 let mut tx = self.engine.db.begin().await?;
                 tx.remove(Kind::DraftSession, a.id).await?;
                 tx.commit().await?;
-                self.say(a, "saved", vec![self.back(a, "plan-menu").await?])
-                    .await?;
+                self.say(a, "saved", vec![]).await?;
+                self.setup_status(a, draft.plan_id, None).await?;
+                if let Some(previous) = d.reply_to {
+                    let _ = self.telegram.clear_menu(a.chat_id, previous).await;
+                }
                 return Ok(());
             }
             _ => return Err(RuleError::StaleAction.into()),
         }
         self.store_dialog(&d).await?;
-        self.render_draft(a, &d, message).await
+        let same_question = previous_step == d.step
+            || selection_step(&previous_step)
+                .zip(selection_step(&d.step))
+                .is_some_and(|((previous, _), (current, _))| previous == current);
+        self.render_draft(
+            a,
+            &d,
+            if same_question && verb != "continue" {
+                message
+            } else {
+                None
+            },
+        )
+        .await
     }
 
     pub(super) async fn set_timing(
@@ -411,28 +531,47 @@ impl BotUi {
                     .draft_blocks(a.id, d.draft_id.ok_or(Error::InvalidInput)?)
                     .await?
                     .len();
-                for name in ["text", "file"] {
-                    buttons.push(self.draft_button(a, d, name, name).await?);
-                }
                 if count > 0 {
-                    buttons.push(self.draft_button(a, d, "ready", "review").await?);
-                    buttons.push(self.draft_button(a, d, "blocks", "manage-blocks").await?);
+                    buttons.push(self.draft_button(a, d, "threshold", "draft-next").await?);
                 }
-                buttons.push(self.draft_button(a, d, "formatting", "formatting").await?);
-                buttons.push(self.draft_button(a, d, "name", "name-secret").await?);
-                buttons.push(self.draft_button(a, d, "guardians", "edit-people").await?);
+                buttons.push(self.draft_button(a, d, "options", "draft-options").await?);
+                buttons.push(self.draft_button(a, d, "recipients", "back").await?);
                 format!(
-                    "{}\n\n{}: {count}/20",
+                    "{}\n\n{}\n\n{}: {count}/20",
+                    tr(&a.locale, "draft-stage-content"),
                     tr(&a.locale, "builder"),
                     tr(&a.locale, "block-count")
                 )
+            }
+            "options" => {
+                for name in ["text", "file"] {
+                    buttons.push(self.draft_button(a, d, name, name).await?);
+                }
+                buttons.push(self.draft_button(a, d, "formatting", "formatting").await?);
+                if !self
+                    .engine
+                    .draft_blocks(a.id, d.draft_id.ok_or(Error::InvalidInput)?)
+                    .await?
+                    .is_empty()
+                {
+                    buttons.push(self.draft_button(a, d, "blocks", "manage-blocks").await?);
+                }
+                buttons.push(self.draft_button(a, d, "name", "name-secret").await?);
+                buttons.push(self.draft_button(a, d, "guardians", "edit-people").await?);
+                buttons.push(self.draft_button(a, d, "discard", "discard").await?);
+                buttons.push(self.draft_button(a, d, "builder", "back").await?);
+                tr(&a.locale, "draft-options-explained")
             }
             "formatting" => {
                 for name in ["copyable", "spoiler"] {
                     buttons.push(self.draft_button(a, d, name, name).await?);
                 }
-                buttons.push(self.draft_button(a, d, "builder", "back").await?);
-                tr(&a.locale, "formatting-explained")
+                buttons.push(self.draft_button(a, d, "options", "back").await?);
+                format!(
+                    "{}\n\n{}",
+                    tr(&a.locale, "formatting"),
+                    tr(&a.locale, "formatting-explained")
+                )
             }
             "blocks" => {
                 let blocks = self
@@ -456,7 +595,7 @@ impl BotUi {
                         .await?,
                     );
                 }
-                buttons.push(self.draft_button(a, d, "builder", "back").await?);
+                buttons.push(self.draft_button(a, d, "options", "back").await?);
                 tr(&a.locale, "manage-blocks")
             }
             step if step.starts_with("block.") => {
@@ -500,104 +639,146 @@ impl BotUi {
                     self.draft_button(a, d, "discard-confirmed", "discard-confirmed")
                         .await?,
                 );
-                buttons.push(self.draft_button(a, d, "builder", "back").await?);
-                tr(&a.locale, "discard-explained")
+                buttons.push(self.draft_button(a, d, "options", "back").await?);
+                format!(
+                    "{}\n\n{}",
+                    tr(&a.locale, "draft-stage-discard"),
+                    tr(&a.locale, "discard-explained")
+                )
             }
             "seal" => {
                 buttons.push(self.draft_button(a, d, "seal", "seal-confirmed").await?);
                 buttons.push(self.draft_button(a, d, "ready", "back").await?);
-                tr(&a.locale, "seal-explained")
+                format!(
+                    "{}\n\n{}",
+                    tr(&a.locale, "draft-stage-seal"),
+                    tr(&a.locale, "seal-explained")
+                )
             }
             "text" | "copyable" | "spoiler" | "file" => {
-                buttons.push(self.draft_button(a, d, "builder", "back").await?);
-                tr(
-                    &a.locale,
-                    if d.step == "file" {
-                        "file-prompt"
-                    } else {
-                        "block-prompt"
-                    },
+                let previous = if matches!(d.step.as_str(), "copyable" | "spoiler") {
+                    "formatting"
+                } else {
+                    "options"
+                };
+                buttons.push(self.draft_button(a, d, previous, "back").await?);
+                format!(
+                    "{}\n\n{}",
+                    tr(&a.locale, &d.step),
+                    tr(
+                        &a.locale,
+                        if d.step == "file" {
+                            "file-prompt"
+                        } else {
+                            "block-prompt"
+                        },
+                    )
                 )
             }
             "file-pending" => tr(&a.locale, "awaiting-file"),
-            "guardians" | "recipients" => {
-                let people = self
+            step if selection_step(step).is_some() => {
+                let (role, page) = selection_step(step).ok_or(RuleError::StaleAction)?;
+                let people: Vec<_> = self
                     .engine
                     .contacts(a.id, d.plan_id.ok_or(Error::InvalidInput)?)
-                    .await?;
-                let labels: Vec<_> = people
+                    .await?
                     .into_iter()
                     .filter(|p| p.confirmed && !p.archived)
-                    .map(|p| {
-                        let name = p.label.unwrap_or_else(|| p.telegram_id.to_string());
-                        (
-                            p.account_id,
-                            format!(
-                                "{} {}",
-                                if d.selected.contains(&p.account_id) {
-                                    "✓"
-                                } else {
-                                    "○"
-                                },
-                                name
-                            ),
-                        )
-                    })
                     .collect();
-                let empty = labels.is_empty();
-                for (person, label) in labels {
+                let start =
+                    page.min(people.len().saturating_sub(1) / PEOPLE_PER_PAGE) * PEOPLE_PER_PAGE;
+                let selected: Vec<_> = people
+                    .iter()
+                    .filter(|person| d.selected.contains(&person.account_id))
+                    .map(person_name)
+                    .collect();
+                if !selected.is_empty() {
+                    buttons.push(self.draft_button(a, d, "done", "draft-next").await?);
+                }
+                for person in people.iter().skip(start).take(PEOPLE_PER_PAGE) {
+                    let chosen = d.selected.contains(&person.account_id);
                     buttons.push(
                         self.draft_button_label(
                             a,
                             d,
                             &format!(
                                 "{}.{}",
-                                if d.selected.contains(&person) {
-                                    "unselect"
-                                } else {
-                                    "select"
-                                },
-                                person.simple()
+                                if chosen { "unselect" } else { "select" },
+                                person.account_id.simple()
                             ),
-                            &label,
+                            &format!("{} {}", if chosen { "✓" } else { "○" }, person_name(person)),
                         )
                         .await?,
                     );
                 }
-                if !d.selected.is_empty() {
-                    buttons.push(self.draft_button(a, d, "done", "done").await?);
+                if start > 0 {
+                    buttons.push(
+                        self.draft_button(
+                            a,
+                            d,
+                            &format!("page.{}", start / PEOPLE_PER_PAGE - 1),
+                            "page-previous",
+                        )
+                        .await?,
+                    );
                 }
-                if empty {
-                    buttons.push(self.b(a, "participants", None, d.plan_id, true).await?);
+                if start + PEOPLE_PER_PAGE < people.len() {
+                    buttons.push(
+                        self.draft_button(
+                            a,
+                            d,
+                            &format!("page.{}", start / PEOPLE_PER_PAGE + 1),
+                            "page-next",
+                        )
+                        .await?,
+                    );
                 }
                 buttons.push(
-                    self.draft_button(
-                        a,
-                        d,
-                        if d.step == "guardians" {
-                            "builder"
-                        } else {
-                            "guardians"
-                        },
-                        "back",
-                    )
-                    .await?,
+                    self.draft_button(a, d, "invite", "setup-add-person")
+                        .await?,
                 );
-                if empty {
+                if role == "recipients" {
+                    buttons.push(self.draft_button(a, d, "guardians", "back").await?);
+                } else {
+                    let mut tx = self.engine.db.begin().await?;
+                    let draft: Draft =
+                        get(&mut *tx, d.draft_id.ok_or(Error::InvalidInput)?).await?;
+                    tx.commit().await?;
+                    if draft.policy.is_some() {
+                        buttons.push(self.draft_button(a, d, "options", "back").await?);
+                    } else {
+                        buttons.push(self.back(a, "home").await?);
+                    }
+                }
+                if people.is_empty() {
                     tr(&a.locale, "no-confirmed-people")
                 } else {
                     format!(
-                        "{}\n\n{}: {}/10",
+                        "{}\n\n{}\n\n{}: {}/10\n{}\n\n{}",
                         tr(
                             &a.locale,
-                            if d.step == "guardians" {
+                            if role == "guardians" {
+                                "draft-stage-guardians"
+                            } else {
+                                "draft-stage-recipients"
+                            }
+                        ),
+                        tr(
+                            &a.locale,
+                            if role == "guardians" {
                                 "choose-guardians"
                             } else {
                                 "choose-recipients"
                             }
                         ),
                         tr(&a.locale, "selected-count"),
-                        d.selected.len()
+                        selected.len(),
+                        if selected.is_empty() {
+                            tr(&a.locale, "draft-none-selected")
+                        } else {
+                            selected.join(", ")
+                        },
+                        tr(&a.locale, "draft-selection-help")
                     )
                 }
             }
@@ -613,56 +794,79 @@ impl BotUi {
                         .await?,
                     );
                 }
-                buttons.push(self.draft_button(a, d, "recipients", "back").await?);
-                tr(&a.locale, "choose-threshold")
+                buttons.push(self.draft_button(a, d, "builder", "back").await?);
+                format!(
+                    "{}\n\n{}",
+                    tr(&a.locale, "draft-stage-threshold"),
+                    tr(&a.locale, "choose-threshold")
+                )
             }
             "timing-choice" | "timing" | "timing-reminder" | "timing-inactivity"
             | "timing-wait" => {
-                buttons.push(
-                    self.draft_button(a, d, "timing-default", "timing-default")
-                        .await?,
-                );
-                if d.step == "timing-choice" {
+                if matches!(d.step.as_str(), "timing-choice" | "timing") {
+                    buttons.push(
+                        self.draft_button(a, d, "timing-default", "timing-default")
+                            .await?,
+                    );
                     buttons.push(
                         self.draft_button(a, d, "timing-custom", "timing-custom")
                             .await?,
                     );
                 }
-                buttons.push(self.draft_button(a, d, "threshold", "back").await?);
-                tr(
-                    &a.locale,
-                    match d.step.as_str() {
-                        "timing" => "choose-timing",
-                        "timing-reminder" => "timing-reminder-prompt",
-                        "timing-inactivity" => "timing-inactivity-prompt",
-                        "timing-wait" => "timing-wait-prompt",
-                        _ => "timing-explained",
-                    },
+                let previous = match d.step.as_str() {
+                    "timing-reminder" => "timing-choice",
+                    "timing-inactivity" => "timing-reminder",
+                    "timing-wait" => "timing-inactivity",
+                    _ => "threshold",
+                };
+                buttons.push(self.draft_button(a, d, previous, "back").await?);
+                format!(
+                    "{}\n\n{}",
+                    tr(&a.locale, "draft-stage-timing"),
+                    tr(
+                        &a.locale,
+                        match d.step.as_str() {
+                            "timing" => "choose-timing",
+                            "timing-reminder" => "timing-reminder-prompt",
+                            "timing-inactivity" => "timing-inactivity-prompt",
+                            "timing-wait" => "timing-wait-prompt",
+                            _ => "timing-explained",
+                        },
+                    )
                 )
             }
             "ready" => {
                 let mut tx = self.engine.db.begin().await?;
                 let draft: Draft = get(&mut *tx, d.draft_id.ok_or(Error::InvalidInput)?).await?;
                 let policy = draft.policy.ok_or(Error::InvalidInput)?;
-                let mut guardians = Vec::new();
-                let mut recipients = Vec::new();
-                for id in &policy.guardians {
-                    guardians.push(get::<Account>(&mut *tx, *id).await?.telegram_id.to_string());
-                }
-                for id in &policy.recipients {
-                    recipients.push(get::<Account>(&mut *tx, *id).await?.telegram_id.to_string());
-                }
                 tx.commit().await?;
+                let contacts = self
+                    .engine
+                    .contacts(a.id, d.plan_id.ok_or(Error::InvalidInput)?)
+                    .await?;
+                let names = |ids: &std::collections::BTreeSet<Id>| {
+                    ids.iter()
+                        .map(|id| {
+                            contacts
+                                .iter()
+                                .find(|person| person.account_id == *id)
+                                .map(person_name)
+                                .unwrap_or_else(|| tr(&a.locale, "person-unavailable"))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let guardians = names(&policy.guardians);
+                let recipients = names(&policy.recipients);
                 for (verb, label) in [
                     ("preview", "preview"),
                     ("save", "save"),
                     ("builder", "edit-blocks"),
-                    ("guardians", "edit-people"),
                 ] {
                     buttons.push(self.draft_button(a, d, verb, label).await?);
                 }
-                format!(
-                    "{}\n\n{}: {}\n{}: {}\n{}: {} / {}\n{}: {} / {} / {}",
+                let mut summary = format!(
+                    "{}\n\n{}\n\n{}: {}\n{}: {}\n{}: {} / {}\n{}: {} / {} / {}",
+                    tr(&a.locale, "draft-stage-review"),
                     tr(&a.locale, "draft-ready"),
                     tr(&a.locale, "guardians-label"),
                     guardians.join(", "),
@@ -675,27 +879,62 @@ impl BotUi {
                     policy.timing.reminder_seconds / DAY,
                     policy.timing.inactivity_seconds / DAY,
                     policy.timing.release_delay_seconds / DAY
-                )
+                );
+                if policy.threshold == 1 {
+                    summary.push_str(&format!("\n\n{}", tr(&a.locale, "single-approval-warning")));
+                }
+                summary
             }
             _ => return Err(RuleError::StaleAction.into()),
         };
-        if d.threshold == 1 && matches!(d.step.as_str(), "timing-choice" | "ready" | "seal") {
-            text.push_str(&format!("\n\n{}", tr(&a.locale, "single-approval-warning")));
+        if matches!(d.step.as_str(), "guardians" | "builder" | "ready") {
+            let mut tx = self.engine.db.begin().await?;
+            let draft: Draft = get(&mut *tx, d.draft_id.ok_or(Error::InvalidInput)?).await?;
+            tx.commit().await?;
+            text.push_str(&format!(
+                "\n\n{}: {}",
+                tr(&a.locale, "draft-until"),
+                self.date(a, draft.expires_at.min(draft.created_at + 3600))
+                    .await?
+            ));
         }
+        let message_id = self
+            .screen_grid_id(
+                a,
+                &text,
+                buttons.into_iter().map(|button| vec![button]).collect(),
+                message,
+            )
+            .await?;
         let mut tx = self.engine.db.begin().await?;
-        let draft: Draft = get(&mut *tx, d.draft_id.ok_or(Error::InvalidInput)?).await?;
+        tx.lock(Kind::DraftSession, a.id).await?;
+        let mut current = tx
+            .get(Kind::DraftSession, a.id)
+            .await?
+            .map(serde_json::from_value::<DraftSession>)
+            .transpose()
+            .map_err(|_| Error::Internal)?;
+        let updated = if let Some(current) = current.as_mut().filter(|current| {
+            current.dialog.draft_id == d.draft_id
+                && current.dialog.step == d.step
+                && current.dialog.reply_to == d.reply_to
+        }) {
+            current.dialog.reply_to = Some(message_id);
+            put(&mut *tx, current.dialog.plan_id, current).await?;
+            true
+        } else {
+            false
+        };
         tx.commit().await?;
-        text.push_str(&format!(
-            "\n\n{}: {}",
-            tr(&a.locale, "draft-until"),
-            self.date(a, draft.expires_at.min(draft.created_at + 3600))
-                .await?
-        ));
-        if !matches!(d.step.as_str(), "discard" | "seal") {
-            buttons.push(self.draft_button(a, d, "discard", "discard").await?);
+        if updated {
+            if let Some(previous) = d.reply_to.filter(|previous| *previous != message_id) {
+                let _ = self.telegram.clear_menu(a.chat_id, previous).await;
+            }
+        } else if message != Some(message_id) {
+            // A late upload/render cannot make a superseded question actionable.
+            let _ = self.telegram.clear_menu(a.chat_id, message_id).await;
         }
-        buttons.push(self.nav(a, "home").await?);
-        self.screen(a, &text, buttons, message).await
+        Ok(())
     }
 }
 

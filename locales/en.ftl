@@ -15,10 +15,10 @@ participants = People
 invite = Invite a person
 confirm-person = Confirm this person
 joined = Invitation accepted. The owner must confirm you.
-participant-joined = Someone accepted your invitation. Open People to confirm their Telegram ID.
+participant-joined = Someone accepted your invitation. Open People, check their name and username with them, then confirm this person.
 secrets = Secrets
 saved = Encrypted and saved. Content is no longer available to the owner. Guardians must save their codes before this secret is armed.
-secret-armed = All guardian codes were acknowledged. The secret is ready; arm the plan when you are ready.
+secret-armed = All guardian codes were acknowledged. Check readiness to see your next step.
 recovery-key = Save this recovery key outside Telegram. It can stop the plan and transfer ownership. It cannot reveal saved content.
 guardian-key = Save this guardian code outside Telegram. It is needed to confirm a future release request.
 saved-delete = Saved — delete this message
@@ -41,9 +41,9 @@ copyable = Copyable text
 spoiler = Hidden text
 file = File
 block-prompt = Send the content for this block. For a file, send a document with an optional caption.
-builder = Add the content to pass on. Review it before saving; your chosen people and timing are kept.
-choose-guardians = Select the people who must confirm a release, then Done. Being a guardian does not itself grant access to the content.
-choose-recipients = Select who will receive the content, then Done. A recipient may also be a guardian.
+builder = Send a text message or attach a document now. You can add more messages or files, then press Continue. Formatting and editing are under More options.
+choose-guardians = Select the people who can confirm a release, then Continue. Being a guardian does not itself grant access to the content.
+choose-recipients = Select who will receive the content, then Continue. A recipient may also be a guardian.
 choose-threshold = Select how many guardians must confirm.
 choose-timing = Send three whole numbers in days: reminders (1–30), inactivity (2–365), waiting (1–30). Example: 7 28 7. Inactivity must be at least twice the reminder interval. You can correct the numbers here without restarting.
 preview = Preview the draft
@@ -99,7 +99,7 @@ choose-people = Choose trusted people
 block-count = Blocks added
 selected-count = Selected
 file-prompt = Send a document up to 10 MB, with an optional caption. Use Back to choose another block type.
-no-confirmed-people = No confirmed trusted people yet. Open People, send an invitation, then confirm the person after they join. Return to My plan → Continue draft; your blocks are kept until the draft expires.
+no-confirmed-people = No confirmed trusted people yet. Invite someone, wait for them to accept, then verify and confirm them. Use /continue to return; an existing draft keeps its content until it expires.
 add-block-first = Add at least one text or file block before choosing trusted people.
 select-person-first = Select at least one person to continue.
 selection-limit = You can select up to 10 people.
@@ -122,17 +122,31 @@ cancellation-votes = Cancellation votes
 secret-reference = Secret reference
 delete-secret-confirm = This secret is paused. Delete it permanently? Other secrets stay. This confirmation expires in 5 minutes; going back leaves this secret paused. Previously received copies cannot be recalled.
 help = Help
-help-text = Home shows your plan's readiness, deadlines and next step. People holds invitations; Inbox holds requests where you are a guardian and received transmissions. Advanced controls appear in each card. Drafts expire 15 minutes after the last added block, at most one hour, and close on restart. Save encrypts the content and ends your access to it.
+help-text = Help
 
+    Setup: Answer one question at a time. Each next step arrives as a new message; choosing people updates the current question. Save your recovery key, invite and confirm people, then prepare a secret.
+
+    Your secret: Choose guardians and recipients, send text or a document, then set the required confirmations and timing. Review everything before Save. Send content only when asked; follow the buttons or input prompt at other steps. Editing and formatting are under More options.
+
+    Navigation: Home shows readiness and deadlines. Continue returns to your next question. Inbox holds guardian requests and received transmissions.
+
+    Drafts: They expire 15 minutes after the last added block, at most one hour, and close on restart.
+
+    Saving: Save seals the encrypted content. Afterward, you can no longer read or edit it.
+
+    Commands:
+    /continue returns to your current setup step without losing your draft.
     /checkin confirms your activity and cancels pending release requests.
-    /stop stops new transmissions. Copies already received cannot be recalled.
+    /stop asks you to confirm stopping new transmissions.
     /status shows your plan and saved secrets.
     /guardians opens requests and delivery retries.
     /settings changes language and opens recovery.
-    /start opens the main menu.
+    /start continues unfinished setup or opens Home.
 
-    Use only synthetic test data in this build.
-owner-label = Owner (Telegram ID)
+    Received copies: Copies already received cannot be recalled.
+
+    Test build: Use only synthetic test data.
+owner-label = Owner
 receiving = Receiving
 timezone = Time display
 history = Activity history
@@ -260,3 +274,82 @@ recovery-admission-failed = Recovery could not start: check the key or try again
 service-busy = The service is busy and could not accept your last ordinary action. Please try it again later. Stop and recovery use a reserved queue; your existing protections remain in place. If a key or code message is still visible, delete it manually.
 recovery-pending-guidance = Ownership recovery is pending. The new account must save and acknowledge its replacement key in the key message. The plan stays paused. Key replacement is unavailable until this request is resolved or expires.
 recovery-save-guidance = Find the recovery-key message, save the key somewhere safe and press its acknowledgment button. If that message is unavailable, replace the key here and save the new one; the old key will stop working.
+
+nav-home = 🏠 Home
+nav-continue = ▶️ Continue
+navigation-hint = Quick navigation
+
+    Home opens your overview. Continue returns to your current setup step.
+    You can hide these buttons with the keyboard icon.
+continue-setup = Continue setup →
+back-to-people = Back to people
+person-details = Details and options
+confirm-person-explained = Is this the person you invited? Check their name and username with them before confirming. A Telegram name alone is not proof of identity.
+person-confirmed-next = This person is confirmed. Continue setting up your secret, or return to People to invite someone else.
+confirm-stop = Yes, stop
+cancel = Cancel
+stop-question = Stop all transfers?
+
+    All secrets in your plan will be paused. You can resume them deliberately later. A transfer already in progress or a received copy cannot be recalled.
+
+    Nothing changes until you confirm. This confirmation is valid for 5 minutes.
+stop-secret-question = Stop this secret?
+
+    New transfers of this secret will be paused. Other secrets stay unchanged. A transfer already in progress or a received copy cannot be recalled.
+
+    Nothing changes until you confirm. This confirmation is valid for 5 minutes.
+draft-next = Continue →
+draft-options = More options
+draft-options-explained = More options
+
+    Change formatting, order, name or delivery rules here. Your content is kept.
+draft-selection-help = Tap people to select or remove them. When the list below is right, press Continue.
+draft-none-selected = Nobody selected yet
+
+secret-options = More options
+
+draft-stage-guardians = 1/6 · Who should confirm release?
+draft-stage-recipients = 2/6 · Who should receive this secret?
+draft-stage-threshold = 4/6 · How many confirmations are needed?
+draft-stage-timing = 5/6 · When should release begin?
+draft-stage-content = 3/6 · What would you like to pass on?
+draft-stage-review = 6/6 · Is everything correct?
+draft-stage-seal = 6/6 · Encrypt and save this secret?
+draft-stage-discard = Discard this draft?
+
+stop-cancelled = Stop cancelled. Your plan and secrets are unchanged.
+
+setup-recovery-title = Save your recovery key
+setup-recovery-question = Have you saved your key somewhere safe outside Telegram?
+
+    Find the separate recovery-key message and press “Saved — delete this message” after saving it. Do not send secret content yet.
+setup-recovery-refresh = Check this step
+setup-key-missing = Can't find my key
+setup-people-title = Choose your trusted people
+setup-people-question = Who would you like to trust?
+
+    Add a person to get a private invitation link. They must open the bot and accept it. Then check their identity with them and confirm them here.
+setup-add-person = Invite a person
+setup-check-people = Check who joined
+setup-next = Continue →
+setup-confirm-person = Yes, confirm this person
+setup-reject-person = No, reject this person
+setup-person-question = Is this the person you invited?
+
+    Check their name and username with them before confirming. A Telegram name alone is not proof of identity.
+setup-invite-title = Send this invitation
+setup-invite-question = Send the private link below to one person. Ask them to open the bot and accept, then check who joined.
+setup-confirmed = Confirmed people
+setup-pending = Awaiting your confirmation
+setup-no-people = Nobody confirmed yet
+setup-finish-title = Finish preparing your plan
+setup-wait-codes = Have all guardians saved their codes?
+
+    Each guardian must save and acknowledge their own code within 24 hours. Wait for everyone, then check readiness.
+setup-ready-question = Ready to enable your plan?
+
+    Check your saved people and timing, then enable activity monitoring when you are ready.
+setup-active = Your plan is active and the new secret is ready. Keep confirming your activity when reminded.
+setup-check-readiness = Check readiness
+setup-enable = Enable my plan
+setup-use-buttons = Choose a button for this question. This text or file was not saved. Send content only when asked what you would like to pass on.

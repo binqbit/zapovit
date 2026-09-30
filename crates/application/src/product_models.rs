@@ -83,6 +83,7 @@ pub struct GuardianOverview {
     pub secret_id: Id,
     pub plan_id: Id,
     pub owner_telegram_id: i64,
+    pub owner_display_name: Option<String>,
     pub state: SecretState,
     pub grant_id: Option<Id>,
     pub code_ready: bool,
@@ -99,6 +100,7 @@ pub struct RecipientOverview {
     pub secret_id: Id,
     pub plan_id: Id,
     pub owner_telegram_id: i64,
+    pub owner_display_name: Option<String>,
     pub state: SecretState,
     pub parts: Vec<RecipientPart>,
     pub retry_until: Option<i64>,
@@ -116,6 +118,9 @@ pub struct ContactView {
     pub account_id: Id,
     pub telegram_id: i64,
     pub label: Option<String>,
+    pub display_name: Option<String>,
+    /// Username without the leading @, for identity details only.
+    pub username: Option<String>,
     pub confirmed: bool,
     pub archived: bool,
     pub dependent_secrets: Vec<Id>,
@@ -136,6 +141,7 @@ pub struct InvitationView {
     pub id: Id,
     pub plan_id: Id,
     pub owner_telegram_id: i64,
+    pub owner_display_name: Option<String>,
     pub expires_at: i64,
     pub status: InvitationStatus,
 }

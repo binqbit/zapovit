@@ -32,6 +32,11 @@ pub struct MenuButton {
     pub data: String,
     pub style: Option<&'static str>,
 }
+pub struct ChatIdentity {
+    pub first_name: String,
+    pub last_name: Option<String>,
+    pub username: Option<String>,
+}
 impl Telegram {
     pub fn new(base: &str, token: Zeroizing<String>) -> Result<Self> {
         let url = reqwest::Url::parse(base).map_err(|_| Error::Config)?;
@@ -160,6 +165,7 @@ impl Telegram {
         for (language, locale) in [("", "en"), ("uk", "uk")] {
             let commands: Vec<_> = [
                 ("start", "home"),
+                ("continue", "continue-setup"),
                 ("help", "help"),
                 ("status", "status"),
                 ("checkin", "checkin"),
@@ -263,6 +269,64 @@ impl Telegram {
         self.send_text_reserved(chat, text, entities, buttons, reply_to)
             .await
     }
+    /// Optional presentation metadata for an existing private contact, never authority.
+    pub async fn chat_identity(&self, chat: i64) -> Option<ChatIdentity> {
+        if self.remaining_cooldown().await.is_some() {
+            return None;
+        }
+        let response = self
+            .client
+            .post(self.url("getChat"))
+            .timeout(Duration::from_secs(2))
+            .json(&json!({"chat_id":chat}))
+            .send()
+            .await
+            .ok()?;
+        let value = Self::bounded(response, 64 * 1024).await.ok()?;
+        if value["error_code"] == 429 {
+            self.observe_retry(&SendResult::RetryAfter(
+                value["parameters"]["retry_after"].as_i64().unwrap_or(60),
+            ))
+            .await;
+            return None;
+        }
+        let data = &value["result"];
+        if value["ok"] != true || data["id"] != chat || data["type"] != "private" {
+            return None;
+        }
+        Some(ChatIdentity {
+            first_name: data["first_name"].as_str()?.to_owned(),
+            last_name: data["last_name"].as_str().map(str::to_owned),
+            username: data["username"].as_str().map(str::to_owned),
+        })
+    }
+    /// A hideable keyboard below the input field, separate from contextual inline actions.
+    pub async fn navigation_keyboard(
+        &self,
+        chat: i64,
+        text: &str,
+        home: &str,
+        resume: &str,
+    ) -> SendResult {
+        if let Some(seconds) = self.remaining_cooldown().await {
+            return SendResult::RetryAfter(seconds);
+        }
+        self.reserve_send(chat).await;
+        let response = self
+            .client
+            .post(self.url("sendMessage"))
+            .timeout(Duration::from_secs(15))
+            .json(
+                &json!({"chat_id":chat,"text":text,"entities":menu_entities(text),
+                "reply_markup":{"keyboard":[[{"text":home},{"text":resume}]],
+                    "resize_keyboard":true,"one_time_keyboard":false,"is_persistent":false}}),
+            )
+            .send()
+            .await;
+        let result = Self::classify(response).await;
+        self.observe_retry(&result).await;
+        result
+    }
     /// Open Telegram's reply UI so a guardian's code stays bound to its request.
     pub async fn send_prompt(&self, chat: i64, text: &str) -> SendResult {
         if text.is_empty() || text.encode_utf16().count() > 4096 {
@@ -310,6 +374,23 @@ impl Telegram {
             .collect();
         self.menu_message(chat, Some(message), text, rows).await
     }
+    /// Retire buttons on an earlier question without rewriting the conversation.
+    pub async fn clear_menu(&self, chat: i64, message: i64) -> SendResult {
+        if let Some(seconds) = self.remaining_cooldown().await {
+            return SendResult::RetryAfter(seconds);
+        }
+        let response = self
+            .client
+            .post(self.url("editMessageReplyMarkup"))
+            .timeout(Duration::from_secs(2))
+            .json(&json!({"chat_id":chat,"message_id":message,
+                "reply_markup":{"inline_keyboard":[]}}))
+            .send()
+            .await;
+        let result = Self::classify(response).await;
+        self.observe_retry(&result).await;
+        result
+    }
     /// Render an ordinary navigation card. Secret content uses send_block instead.
     pub async fn menu_message(
         &self,
@@ -353,7 +434,7 @@ impl Telegram {
             })
             .collect();
         let mut body = json!({"chat_id":chat,"text":text,
-            "entities":[],"link_preview_options":{"is_disabled":true},
+            "entities":menu_entities(text),"link_preview_options":{"is_disabled":true},
             "reply_markup":{"inline_keyboard":keyboard}});
         if let Some(id) = message {
             body["message_id"] = json!(id);
@@ -606,9 +687,62 @@ pub fn entity(text: &str, kind: MessageEntityKind) -> MessageEntity {
     }
 }
 
+/// Native Telegram formatting with UTF-16 spans. User-controlled names remain
+/// literal text; neither HTML tags nor Markdown characters are interpreted.
+fn menu_entities(text: &str) -> Vec<MessageEntity> {
+    let mut result = Vec::new();
+    let mut offset = 0;
+    for (index, line) in text.split('\n').enumerate() {
+        let length = line.encode_utf16().count();
+        let emphasized = if index == 0 && length <= 100 {
+            length
+        } else if let Some((label, _)) = line.split_once(": ") {
+            let length = label.encode_utf16().count();
+            if length <= 40 { length + 1 } else { 0 }
+        } else {
+            0
+        };
+        if emphasized > 0 {
+            result.push(MessageEntity {
+                kind: MessageEntityKind::Bold,
+                offset,
+                length: emphasized,
+            });
+        }
+        offset += length + 1;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn menu_formatting_keeps_names_literal_and_utf16_spans_valid() {
+        let text = "🔐 <Іра & *Олег*>\n\nСтан: Очікування\nКоди: 1 / 2";
+        let entities = menu_entities(text);
+        assert_eq!(entities.len(), 3);
+        assert_eq!(entities[0].offset, 0);
+        assert_eq!(
+            entities[0].length,
+            text.lines().next().unwrap().encode_utf16().count()
+        );
+        assert_eq!(
+            entities[1].offset,
+            text.split("Стан:").next().unwrap().encode_utf16().count()
+        );
+        assert!(
+            entities
+                .iter()
+                .all(|e| matches!(e.kind, MessageEntityKind::Bold))
+        );
+        assert!(
+            entities
+                .iter()
+                .all(|e| e.offset + e.length <= text.encode_utf16().count())
+        );
+        assert!(menu_entities("").is_empty());
+    }
     #[test]
     fn entity_offsets_use_utf16_without_normalizing() {
         let text = "🔐 e\u{301} пароль";

@@ -1,5 +1,54 @@
 # Implementation verification
 
+## Conversational creation follow-up on 30 September 2026
+
+Creation now uses one question at a time: recovery-key acknowledgment and explicit contact confirmation, followed by six numbered draft stages (guardians, recipients, direct content input, quorum, timing, review). Text and documents are accepted directly at the content question. Each stage transition, Back and explicit resume sends a new message; selection changes stay within the same question. Previous inline keyboards are retired using Telegram's [editMessageReplyMarkup](https://core.telegram.org/bots/api#editmessagereplymarkup). Draft mutations also validate the current question message ID, so retiring markup is not the authority check. Home and advanced management remain available separately.
+
+The integration preserves the existing architecture and Engine validation. `adapters/bot/setup.rs` derives preparation from authorized account/plan/contact state; `drafts.rs` uses the existing DraftSession to retain answers and the current question ID. `bot.rs` routes direct content through the existing encrypted append/upload path, while `menus.rs` and `telegram.rs` handle fresh questions and button retirement. No migration, new plaintext content store, changed deadline, or automatic plan activation was introduced. Readiness notifications link to the next relevant question; a plan stopped by its owner stays stopped until explicitly enabled.
+
+Public surfaces changed: `/start` resumes Setup plans, `/continue` asks the current question, creation/invitation/confirmation/content/readiness messages form one guided journey, and the core draft stages have a different order. [README](../README.md), [operations](operations.md#bot-flow), [production plan](production-plan.md) and both locales were synchronized. The earlier descriptions of every transition editing in place, choosing a content type first, and timing before content were corrected against the implemented handlers.
+
+Validation used Rust 1.98.1, isolated PostgreSQL 17.11 and loopback Telegram with synthetic data.
+
+| Check | Result |
+| --- | --- |
+| Default workspace | 51 tests passed |
+| PostgreSQL pipeline | All 98 cases passed together, including six conversational regressions, draft/contact navigation, source cleanup and STOP under saturated ordinary admission |
+| App database tests | Both leadership-loss and journal initialization cases passed |
+| Static and documentation checks | Formatting, locked all-target Clippy with warnings denied, diff whitespace, 304-key locale parity and local documentation targets passed; the documentation drift helper's 20 unmatched tokens were reviewed as internal SQL/constants |
+
+The final combined run covers **151 distinct Rust tests**, with an unchanged source fingerprint. Commands were `cargo test --workspace --locked`, `cargo test -p adapters --test pipeline --locked -- --ignored --test-threads=1`, `cargo test -p app --locked -- --ignored --test-threads=1`, `cargo fmt --all -- --check`, and `cargo clippy --workspace --all-targets --locked -- -D warnings`. Final evidence is in ignored `.agent-workspace/artifacts/pg-l9e2cyom/report.json` and `conversation-clippy-final.log`. Focused navigation (`pg-ffkgfav4`, 22 cases), transport (`pg-oy4pvq0r`, four cases), readiness (`pg-1kh70uoh`, two cases) and admission-fixture (`pg-hh99ngi7`, one case) runs also passed. Test services were stopped; successful disposable databases were removed and first-failure evidence retained. Backup/Garage contracts were not rerun for this adapter change; the existing external release gates below still apply.
+
+The new tests use distinct Telegram message IDs and assert new messages, stale-question rejection, direct text/document capture, source cleanup, pre-key/wrong-stage guidance and explicit activation. Independent review also identified draft input remaining active after Home/Settings, misleading readiness when secrets have different states, and a used confirmation preserving a separate input prompt. Navigation now suspends capture, readiness identifies the pending secret, and replay clears the input prompt. Completion copy requires the latest displayed secret to be Armed without blockers; otherwise the actual secret states are shown. A regression reproduced the older-ready/newer-paused bug before this fix, then passed for five latest-secret states. Other regressions cover suspended input and an older pending secret alongside a newer ready one.
+
+First-failure evidence is retained locally. An initial document test used the final file ciphertext estimate instead of the actual serialized draft-object size; it now checks the object ledger and decrypts the stored content. The first full pipeline run passed 94 cases and failed one recovery-admission fixture assertion. Its retained database shows the requests crossed a minute boundary: the fixture exhausted the previous minute's counter, then the real limiter correctly reset it. The fixture now pins that exhausted-quota precondition for its routing/cleanup assertion; production rate-limit behavior is unchanged. No real Telegram client or deployment was contacted; actual client rendering remains unverified.
+
+## Telegram UX correction on 30 September 2026
+
+This follow-up implements the user's revised interaction requirements: named contacts, contextual confirmation, resumable setup, a hideable Home/Continue keyboard, formatted menu text, prompt cleanup of saved source messages, and explicit confirmation before ordinary STOP. The earlier public-service matrix below remains a separate historical checkpoint.
+
+The existing domain → application/ports → adapters → runtime boundaries remain unchanged. `application/account_names.rs` owns encrypted presentation metadata and authorized projections; application draft transactions own cleanup obligations. `adapters/bot` owns navigation, compact labels and confirmation screens, while `adapters/telegram.rs` owns native UTF-16 message entities and keyboard payloads. PostgreSQL routing preserves reserved admission for the new STOP confirmation/cancel actions. Stored names do not grant authority. Existing migrations remain unchanged; optional JSON fields support older accounts and drafts.
+
+The public surfaces and documentation changed together: [README](../README.md) summarizes setup; [operations](operations.md#bot-flow) specifies navigation, names, source cleanup and confirmation; the [production plan](production-plan.md) records the later STOP decision. Earlier immediate-STOP/no-dialog descriptions were replaced. Verified recovery-key stop retains its credential-validated behavior. Telegram supports [native text entities](https://core.telegram.org/bots/api#messageentity), [hideable reply keyboards](https://core.telegram.org/bots/api#replykeyboardmarkup), and [private-chat source-message deletion with limits](https://core.telegram.org/bots/api#deletemessage). Names containing markup characters remain literal text.
+
+Validation used Rust 1.98.1, isolated PostgreSQL 17.11 and loopback Telegram with synthetic data.
+
+| Check | Result |
+| --- | --- |
+| Default workspace | 51 tests passed, including encrypted-account backward compatibility, UTF-16 formatting and bounded Unicode labels |
+| PostgreSQL pipeline | All 91 cases passed together, including eight source-cleanup regressions, named-contact/resume navigation and STOP confirmation under saturated ordinary admission |
+| App database tests | Both leadership-loss and automatic journal initialization tests passed |
+| Final copy follow-up | After the last English/Ukrainian wording corrections, all 51 default tests plus three people-navigation and one menu-navigation cases passed again |
+| Static and documentation checks | Formatting, locked all-target Clippy with warnings denied, diff whitespace, local documentation file targets and the documentation drift helper passed; the helper's five unmatched tokens are internal SQL/constants |
+
+This follow-up exercised **144 distinct Rust tests**. Commands were `cargo test --workspace --locked`, `cargo test -p adapters --test pipeline --locked -- --ignored --test-threads=1`, `cargo test -p app --locked -- --ignored --test-threads=1`, `cargo fmt --all -- --check`, and `cargo clippy --workspace --all-targets --locked -- -D warnings`. Local reports: `pg-77ge2rzq` (combined matrix), `pg-nyto6wua` (final contact/STOP navigation), `pg-atplqglx` (final localized menus), `ux-final-copy-workspace.log` and `ux-correction-clippy-final.log`. The combined matrix's source fingerprint changed only for the final locale wording; those changes have separate passing checks with stable fingerprints. Existing backup/Garage contracts were not rerun for this UX change.
+
+All test services were stopped. Disposable databases from successful runs and three intermediate compile-only failures were removed; their logs and the original behavioral failure evidence were retained. Auxiliary resources remain Git-ignored in `.agent-workspace/`.
+
+The original cleanup regression run failed four of six cases: cleanup waited for Save and expiry could leave messages without feedback. The expanded eight-case cleanup suite then passed after the transactional fix. A later navigation test reproduced the repeated-confirmation dead end; replay now shows the current contact card after authority checks, without confirming again. First-failure logs and subsequent results remain in ignored `.agent-workspace/artifacts/`; maintained regressions live under `crates/adapters/tests/pipeline_cases/`.
+
+No real Telegram account or deployment was contacted. Loopback payload/state tests validate behavior and entity offsets, not actual Android/iOS/Desktop rendering. The public-release gates listed below remain in effect.
+
 ## Public-service implementation on 30 September 2026
 
 Implemented the accepted [production plan](production-plan.md) within the existing domain → application/ports → adapters → runtime structure. The Telegram adapter projects Engine readiness and uses Engine-authorized operations; button visibility never grants authority. This iteration adds private metadata, contact/invitation lifecycle, independent draft/prompt sessions, block editing, explicit sealing/deletion, scoped resume, recipient views and operation receipts. Runtime work covers ordering, leases, quarantine, resource reservations, bounded scans, freshness, backup sessions and mirrored journal durability. Migrations `0002`–`0004` preserve the original `0001` checksum.

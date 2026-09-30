@@ -760,6 +760,132 @@ async fn runtime_full_navigation_budget_keeps_recovery_acknowledgement_headroom(
 
 #[tokio::test]
 #[ignore = "requires explicitly configured local PostgreSQL"]
+async fn runtime_full_navigation_budget_keeps_stop_confirmation_and_cancel_usable() {
+    use super::menu_navigation::{Screens, button, callback, command, last};
+    use adapters::{bot::BotUi, localization::tr, telegram::Telegram};
+    use axum::{Json, Router, extract::Path, routing::post};
+
+    let f = fixture().await;
+    let owner = f.engine.account(9701, 9701, "en").await.unwrap();
+    let plan_id = f.engine.create_profile(owner.id).await.unwrap();
+    let (profile, initial_plan) = f.engine.own_plan(owner.id).await.unwrap();
+    sqlx::query("INSERT INTO actions(id,data) SELECT md5(n::text)::uuid,jsonb_build_object('id',md5(n::text)::uuid,'name','home') FROM generate_series(1,250000) n")
+        .execute(&f.db.pool).await.unwrap();
+    let screens: Screens = Default::default();
+    let captured = screens.clone();
+    let app = Router::new().route(
+        "/bot1:test/{method}",
+        post(move |Path(method): Path<String>, Json(body): Json<Value>| {
+            let screens = captured.clone();
+            async move {
+                if matches!(
+                    method.as_str(),
+                    "answerCallbackQuery" | "editMessageReplyMarkup"
+                ) {
+                    return Json(json!({"ok":true,"result":true}));
+                }
+                assert!(matches!(method.as_str(), "sendMessage" | "editMessageText"));
+                screens.lock().await.push((method, body));
+                Json(json!({"ok":true,"result":{"message_id":42}}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let ui = BotUi {
+        engine: f.engine.clone(),
+        telegram: Telegram::new(
+            &format!("http://{address}"),
+            Zeroizing::new("1:test".into()),
+        )
+        .unwrap(),
+        username: "synthetic_bot".into(),
+    };
+    assert!(
+        matches!(
+            ui.button(&owner, "home", None, None, false, "Home").await,
+            Err(Error::RateLimited)
+        ),
+        "ordinary navigation is saturated"
+    );
+    let mut sequence = 97000;
+    command(&ui, &mut sequence, owner.telegram_id, "/stop").await;
+    let review = last(&screens).await;
+    let confirm_id = button(&review, &tr("en", "confirm-stop"));
+    let cancel_id = button(&review, &tr("en", "cancel"));
+    let mut tx = f.db.begin().await.unwrap();
+    let now = tx.now().await.unwrap();
+    for (id, expected) in [(&confirm_id, "stop-confirmed"), (&cancel_id, "stop-cancel")] {
+        let action: Action = get(&mut *tx, Id::parse_str(id).unwrap()).await.unwrap();
+        assert_eq!(action.name, expected);
+        assert_eq!(action.actor_id, owner.id);
+        assert_eq!(action.plan_id, Some(plan_id));
+        assert_eq!(action.owner_epoch, Some(profile.owner_epoch));
+        assert!(action.expires_at > now && action.expires_at <= now + 300);
+        if expected == "stop-cancel" {
+            assert_eq!(action.target, Some(Id::parse_str(&confirm_id).unwrap()));
+        }
+    }
+    tx.commit().await.unwrap();
+    callback(&ui, &mut sequence, owner.telegram_id, cancel_id.clone()).await;
+    let cancelled = last(&screens).await;
+    assert_ne!(
+        cancelled, review,
+        "Cancel must reach a visible fallback when ordinary menus are full"
+    );
+    assert_eq!(
+        f.engine.own_plan(owner.id).await.unwrap().1.state,
+        initial_plan.state
+    );
+    let mut tx = f.db.begin().await.unwrap();
+    assert!(
+        get::<Action>(&mut *tx, Id::parse_str(&cancel_id).unwrap())
+            .await
+            .unwrap()
+            .used,
+        "Cancel must complete rather than fall through to generic rate-limit feedback"
+    );
+    assert!(
+        list::<ControlIntent>(&mut *tx, Some(plan_id))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    tx.commit().await.unwrap();
+
+    sequence += 1;
+    let stale_result = ui.handle(100, &json!({"update_id":sequence,"callback_query":{
+        "id":"cancelled-confirmation","from":{"id":owner.telegram_id,"is_bot":false},
+        "data":confirm_id,"message":{"message_id":42,"chat":{"id":owner.chat_id,"type":"private"}}
+    }})).await;
+    // Generic stale-action feedback may also hit the ordinary navigation cap;
+    // neither successful feedback nor this admission failure authorizes STOP.
+    assert!(matches!(stale_result, Ok(()) | Err(Error::RateLimited)));
+    assert_eq!(
+        f.engine.own_plan(owner.id).await.unwrap().1.state,
+        initial_plan.state,
+        "Cancel must retire the old confirmation capability"
+    );
+
+    command(&ui, &mut sequence, owner.telegram_id, "/stop").await;
+    let confirm_id = button(&last(&screens).await, &tr("en", "confirm-stop"));
+    callback(&ui, &mut sequence, owner.telegram_id, confirm_id.clone()).await;
+    assert_eq!(
+        f.engine.own_plan(owner.id).await.unwrap().1.state,
+        PlanState::Paused
+    );
+    let receipt = f
+        .engine
+        .operation_receipt(owner.id, Id::parse_str(&confirm_id).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(receipt.operation, OperationKind::Stop);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly configured local PostgreSQL"]
 async fn runtime_full_protective_reserve_commits_only_prefix_and_retries_without_loss() {
     let f = fixture().await;
     let owner = f.engine.account(9501, 9501, "en").await.unwrap();

@@ -16,9 +16,11 @@ Users interact with Zapovit through a Telegram bot.
 
 The owner decides what to pass on, who should receive it, and under which conditions. Activity confirmations and review by trusted contacts can help determine when to begin the transfer process. Recipients receive their assigned information once the configured conditions are met.
 
-The Telegram interface guides preparation one step at a time: recovery key, confirmed people, roles and timing, content, review, code acknowledgments, then activation. Home shows readiness and deadlines. Private names, separate guardian/recipient views, draft editing and scoped pause/delete controls keep additional options in the relevant card.
+The Telegram interface asks one question at a time. First save the recovery key, invite people and verify their identities. Then prepare a secret in six steps: guardians → recipients → content → required confirmations → timing → review and sealing. Send text or attach a document directly at the content question; add more, then press Continue. Each transition posts a new question, while selections within one question update that message. Editing and formatting stay under More options.
 
-Each accepted text block or uploaded file queues removal of its original chat message as soon as its encrypted draft content is durably stored, before final sealing. Removal can be delayed or refused by Telegram; the bot asks for manual deletion when retries expire or deletion fails permanently.
+Preparation resumes from Engine's existing recovery and contact state. A hideable Home / Continue keyboard and `/continue` return to the next question or active draft. Drafts still expire 15 minutes after the last added block, at most one hour, and close on restart. After sealing, all guardians must acknowledge their codes before the secret is ready; enabling the plan remains explicit.
+
+Each accepted text block or uploaded file queues removal of its original chat message as soon as its encrypted draft content is durably stored, before final sealing. Removal can be delayed or refused by Telegram; the bot asks for manual deletion when retries expire or deletion fails permanently. STOP buttons and `/stop` first show a five-minute confirmation; nothing is paused until confirmation. Recovery-key stopping remains available through `/recoverstop`. See the [bot flow and limits](docs/operations.md#bot-flow).
 
 Missed activity confirmations start a review by trusted contacts. They do not, on their own, establish that the owner is unable to manage their data.
 

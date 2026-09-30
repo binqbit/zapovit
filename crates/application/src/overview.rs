@@ -216,6 +216,7 @@ impl Engine {
                 let plan: Plan = get(&mut *tx, secret.plan_id).await?;
                 let profile: Profile = get(&mut *tx, plan.profile_id).await?;
                 let owner: Account = get(&mut *tx, profile.owner_id).await?;
+                let owner_display_name = self.account_display_name(&owner)?;
                 let case = if let Some(id) = secret.last_case {
                     Some(get::<CaseRecord>(&mut *tx, id).await?)
                 } else {
@@ -237,6 +238,7 @@ impl Engine {
                         secret_id: secret.id,
                         plan_id: plan.id,
                         owner_telegram_id: owner.telegram_id,
+                        owner_display_name: owner_display_name.clone(),
                         state: secret.state,
                         grant_id: grant.as_ref().map(|grant| grant.id),
                         code_ready: grant.as_ref().is_some_and(|grant| grant.ready),
@@ -307,6 +309,7 @@ impl Engine {
                         secret_id: secret.id,
                         plan_id: plan.id,
                         owner_telegram_id: owner.telegram_id,
+                        owner_display_name,
                         state: secret.state,
                         parts,
                         retry_until,

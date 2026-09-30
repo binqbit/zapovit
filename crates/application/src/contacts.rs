@@ -38,6 +38,7 @@ impl Engine {
         let mut tx = self.db.begin().await?;
         Self::owner(&mut *tx, actor, plan).await?;
         let owner: Account = get(&mut *tx, actor).await?;
+        let owner_display_name = self.account_display_name(&owner)?;
         let now = tx.now().await?;
         let mut result = Vec::new();
         for invitation in list::<Invitation>(&mut *tx, Some(plan)).await? {
@@ -46,6 +47,7 @@ impl Engine {
                 id: invitation.id,
                 plan_id: plan,
                 owner_telegram_id: owner.telegram_id,
+                owner_display_name: owner_display_name.clone(),
                 expires_at: invitation.expires_at,
                 status: if state.revoked {
                     InvitationStatus::Revoked
@@ -187,6 +189,7 @@ impl Engine {
             id,
             plan_id: invitation.plan_id,
             owner_telegram_id: owner.telegram_id,
+            owner_display_name: self.account_display_name(&owner)?,
             expires_at: invitation.expires_at,
             status,
         })
@@ -297,6 +300,7 @@ impl Engine {
         let mut result = Vec::new();
         for participant in list::<Participant>(&mut *tx, Some(plan)).await? {
             let account: Account = get(&mut *tx, participant.account_id).await?;
+            let (display_name, username) = self.account_display_parts(&account)?;
             let mut dependent = Vec::new();
             let mut delivery_failed = false;
             for secret in &secrets {
@@ -322,6 +326,8 @@ impl Engine {
                 account_id: account.id,
                 telegram_id: account.telegram_id,
                 label: self.label_in(&mut *tx, plan, participant.id).await?,
+                display_name,
+                username,
                 confirmed: participant.confirmed,
                 archived: !Self::contact_active(&mut *tx, participant.id).await?,
                 dependent_secrets: dependent,

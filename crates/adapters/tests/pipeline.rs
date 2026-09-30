@@ -17,8 +17,14 @@ mod transport_validation;
 #[path = "pipeline_cases/source_cleanup.rs"]
 mod source_cleanup;
 
+#[path = "pipeline_cases/people_navigation.rs"]
+mod people_navigation;
+
 #[path = "pipeline_cases/menu_navigation.rs"]
 mod menu_navigation;
+
+#[path = "pipeline_cases/conversational_navigation.rs"]
+mod conversational_navigation;
 
 #[path = "pipeline_cases/draft_navigation.rs"]
 mod draft_navigation;

@@ -234,7 +234,7 @@ impl PgDatabase {
             .bind(telegram_id.to_string()).fetch_one(&self.pool).await.map_err(|_|Error::Storage)
     }
     pub async fn priority_callback(&self, id: Id, telegram_id: i64) -> Result<bool> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM actions action JOIN accounts a ON action.data->>'actor_id'=a.id::text JOIN plans plan ON action.data->>'plan_id'=plan.id::text JOIN profiles p ON plan.data->>'profile_id'=p.id::text WHERE action.id=$1 AND a.data->>'telegram_id'=$2 AND action.data->>'name' IN ('stop','checkin','stop-secret') AND action.data->>'used'='false' AND (action.data->>'expires_at')::bigint>floor(extract(epoch from clock_timestamp()))::bigint AND p.data->>'owner_id'=a.id::text AND action.data->>'owner_epoch'=p.data->>'owner_epoch' AND p.state<>'deleted' AND plan.state<>'deleted')")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM actions action JOIN accounts a ON action.data->>'actor_id'=a.id::text JOIN plans plan ON action.data->>'plan_id'=plan.id::text JOIN profiles p ON plan.data->>'profile_id'=p.id::text WHERE action.id=$1 AND a.data->>'telegram_id'=$2 AND action.data->>'name' IN ('stop','checkin','stop-secret','stop-confirmed','stop-secret-confirmed','stop-cancel') AND action.data->>'used'='false' AND (action.data->>'expires_at')::bigint>floor(extract(epoch from clock_timestamp()))::bigint AND p.data->>'owner_id'=a.id::text AND action.data->>'owner_epoch'=p.data->>'owner_epoch' AND p.state<>'deleted' AND plan.state<>'deleted')")
             .bind(id).bind(telegram_id.to_string()).fetch_one(&self.pool).await.map_err(|_|Error::Storage)
     }
     pub async fn metrics(&self) -> Result<String> {
@@ -457,7 +457,14 @@ impl Transaction for PgTransaction {
             Kind::Action
                 if matches!(
                     value["name"].as_str(),
-                    Some("ack-recovery" | "ack-claim" | "delete-confirmed")
+                    Some(
+                        "ack-recovery"
+                            | "ack-claim"
+                            | "delete-confirmed"
+                            | "stop-confirmed"
+                            | "stop-secret-confirmed"
+                            | "stop-cancel"
+                    )
                 ) =>
             {
                 Some(260_000)

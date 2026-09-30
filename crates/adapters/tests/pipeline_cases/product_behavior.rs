@@ -2,6 +2,159 @@ use super::*;
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
+async fn telegram_display_names_are_encrypted_and_role_scoped() {
+    let f = fixture().await;
+    let (owner, plan, people) = participants(&f).await;
+    assert_eq!(f.engine.account_display_name(&owner).unwrap(), None);
+    f.engine
+        .update_account_display(
+            owner.id,
+            Some("Марія"),
+            Some("Коваль"),
+            Some("mariia_owner"),
+        )
+        .await
+        .unwrap();
+    f.engine
+        .update_account_display(
+            people[0].id,
+            Some("Олена"),
+            Some("Петренко"),
+            Some("olena_person"),
+        )
+        .await
+        .unwrap();
+    let contact = f
+        .engine
+        .contacts(owner.id, plan)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|person| person.account_id == people[0].id)
+        .unwrap();
+    assert_eq!(contact.display_name.as_deref(), Some("Олена Петренко"));
+    assert_eq!(contact.username.as_deref(), Some("olena_person"));
+    assert_eq!(contact.telegram_id, people[0].telegram_id);
+    f.engine
+        .set_label(owner.id, plan, contact.id, "Private nickname")
+        .await
+        .unwrap();
+    let contact = f
+        .engine
+        .contacts(owner.id, plan)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|person| person.account_id == people[0].id)
+        .unwrap();
+    assert_eq!(contact.label.as_deref(), Some("Private nickname"));
+    assert_eq!(contact.display_name.as_deref(), Some("Олена Петренко"));
+    assert!(f.engine.contacts(people[0].id, plan).await.is_err());
+    assert!(
+        f.engine
+            .owner_label(people[0].id, plan, contact.id)
+            .await
+            .is_err()
+    );
+
+    let invite = f.engine.invite(owner.id, plan).await.unwrap();
+    let preview = f.engine.invitation(people[0].id, invite).await.unwrap();
+    assert_eq!(preview.owner_display_name.as_deref(), Some("Марія Коваль"));
+    assert_eq!(preview.owner_telegram_id, owner.telegram_id);
+    assert!(
+        f.engine
+            .invitations(owner.id, plan)
+            .await
+            .unwrap()
+            .iter()
+            .all(|invitation| invitation.owner_display_name.as_deref() == Some("Марія Коваль"))
+    );
+    secret(&f, &owner, plan, &people, false).await;
+    let projection = f.engine.overview(people[0].id).await.unwrap();
+    assert_eq!(
+        projection.guardian[0].owner_display_name.as_deref(),
+        Some("Марія Коваль")
+    );
+    assert_eq!(
+        projection.receiving[0].owner_display_name.as_deref(),
+        Some("Марія Коваль")
+    );
+    assert_eq!(projection.guardian[0].owner_telegram_id, owner.telegram_id);
+    assert_eq!(projection.receiving[0].owner_telegram_id, owner.telegram_id);
+
+    let mut tx = f.db.begin().await.unwrap();
+    let raw = tx.get(Kind::Account, people[0].id).await.unwrap().unwrap();
+    let account: Account = serde_json::from_value(raw.clone()).unwrap();
+    for plaintext in ["Олена", "Петренко", "olena_person"] {
+        assert!(
+            !raw.to_string().contains(plaintext),
+            "display metadata must be ciphertext at rest"
+        );
+    }
+    tx.commit().await.unwrap();
+    let mut copied = account.clone();
+    copied.id = people[1].id;
+    assert!(
+        matches!(f.engine.account_display_name(&copied), Err(Error::Crypto)),
+        "account identity must authenticate the encrypted metadata"
+    );
+    f.engine
+        .update_account_display(
+            people[0].id,
+            Some("Олена"),
+            Some("Петренко"),
+            Some("olena_person"),
+        )
+        .await
+        .unwrap();
+    f.engine
+        .update_account_display(people[0].id, None, None, Some("incomplete_update"))
+        .await
+        .unwrap();
+    let mut tx = f.db.begin().await.unwrap();
+    assert_eq!(
+        tx.get(Kind::Account, people[0].id).await.unwrap().unwrap(),
+        raw,
+        "identical or incomplete Telegram updates must preserve the encrypted snapshot"
+    );
+    tx.commit().await.unwrap();
+
+    f.engine
+        .update_account_display(people[0].id, Some("Олена"), None, None)
+        .await
+        .unwrap();
+    let contact = f
+        .engine
+        .contacts(owner.id, plan)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|person| person.account_id == people[0].id)
+        .unwrap();
+    assert_eq!(contact.display_name.as_deref(), Some("Олена"));
+    assert_eq!(
+        contact.username, None,
+        "a complete snapshot clears a removed username"
+    );
+    assert_eq!(contact.label.as_deref(), Some("Private nickname"));
+    f.engine
+        .update_account_display(people[1].id, Some(""), None, Some("username_only"))
+        .await
+        .unwrap();
+    let contact = f
+        .engine
+        .contacts(owner.id, plan)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|person| person.account_id == people[1].id)
+        .unwrap();
+    assert_eq!(contact.display_name.as_deref(), Some("@username_only"));
+    assert_eq!(contact.telegram_id, people[1].telegram_id);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
 async fn private_labels_preserve_sealed_policy_and_are_owner_scoped() {
     let f = fixture().await;
     let (owner, plan, people) = participants(&f).await;

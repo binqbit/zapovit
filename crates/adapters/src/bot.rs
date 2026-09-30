@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 
 mod drafts;
 mod menus;
+mod setup;
 mod workspace;
 use menus::Menu;
 
@@ -37,18 +38,6 @@ impl BotUi {
                 buttons,
                 None,
             )
-            .await
-        {
-            SendResult::Sent(id) => Ok(id),
-            SendResult::RetryAfter(_) | SendResult::Permanent | SendResult::Unknown => {
-                Err(Error::MessageUnavailable)
-            }
-        }
-    }
-    async fn text(&self, a: &Account, text: &str, buttons: Vec<(String, String)>) -> Result<i64> {
-        match self
-            .telegram
-            .send_text(a.chat_id, text, vec![], buttons, None)
             .await
         {
             SendResult::Sent(id) => Ok(id),
@@ -86,7 +75,15 @@ impl BotUi {
             epoch,
             name: name.into(),
             target,
-            expires_at: now + if name == "delete-confirmed" { 300 } else { DAY },
+            expires_at: now
+                + if matches!(
+                    name,
+                    "delete-confirmed" | "stop-confirmed" | "stop-secret-confirmed" | "stop-cancel"
+                ) {
+                    300
+                } else {
+                    DAY
+                },
             used: false,
         };
         put(&mut *tx, plan_id, &a).await?;
@@ -284,6 +281,19 @@ impl BotUi {
             return Ok(());
         }
         tx.commit().await?;
+        // Telegram names are presentation metadata; an unavailable refresh must
+        // never prevent a protective control from reaching the Engine.
+        if let Some(first_name) = from["first_name"].as_str() {
+            let _ = self
+                .engine
+                .update_account_display(
+                    a.id,
+                    Some(first_name),
+                    from["last_name"].as_str(),
+                    from["username"].as_str(),
+                )
+                .await;
+        }
         let result = if let Some(c) = callback {
             if let Some(id) = c["id"].as_str() {
                 let (_, result) = tokio::join!(
@@ -396,7 +406,7 @@ impl BotUi {
             }
             tx = self.engine.db.begin().await?;
         }
-        if action.used {
+        if action.used && !["confirm-person", "setup-confirm"].contains(&action.name.as_str()) {
             return Err(RuleError::StaleAction.into());
         }
         if let Some(plan_id) = action.plan_id {
@@ -412,6 +422,9 @@ impl BotUi {
             if ![
                 "stop",
                 "stop-secret",
+                "stop-confirmed",
+                "stop-secret-confirmed",
+                "stop-cancel",
                 "checkin",
                 "ack-grant",
                 "ack-recovery",
@@ -424,7 +437,15 @@ impl BotUi {
             }
         }
         tx.commit().await?;
-        let priority = ["stop", "stop-secret", "checkin"].contains(&action.name.as_str());
+        let priority = [
+            "stop",
+            "stop-secret",
+            "stop-confirmed",
+            "stop-secret-confirmed",
+            "stop-cancel",
+            "checkin",
+        ]
+        .contains(&action.name.as_str());
         if !priority {
             self.engine
                 .limit(&format!("action:{}", a.id), 30, 60)
@@ -433,6 +454,39 @@ impl BotUi {
         let plan = action.plan_id;
         let target = action.target;
         let menu_message = c["message"]["message_id"].as_i64();
+        if !priority
+            && !action.name.starts_with("draft:")
+            && ![
+                "continue-setup",
+                "new-secret",
+                "create",
+                "setup-continue",
+                "setup-recovery-refresh",
+            ]
+            .contains(&action.name.as_str())
+        {
+            self.suspend_draft_question(a).await?;
+        }
+        // A second tap should show this person's current state, without another
+        // mutation or a generic error that strands the owner outside setup.
+        if action.used {
+            let mut tx = self.engine.db.begin().await?;
+            tx.remove(Kind::Dialog, a.id).await?;
+            tx.commit().await?;
+            if action.name == "setup-confirm" {
+                return self
+                    .setup_people(a, plan.ok_or(Error::InvalidInput)?, None)
+                    .await;
+            }
+            return self
+                .person_card(
+                    a,
+                    plan.ok_or(Error::InvalidInput)?,
+                    target.ok_or(Error::InvalidInput)?,
+                    menu_message,
+                )
+                .await;
+        }
         match action.name.as_str() {
             "create" => {
                 match self.engine.own_plan(a.id).await {
@@ -442,10 +496,21 @@ impl BotUi {
                     }
                     Err(error) => return Err(error),
                 }
-                self.say(a, "created", vec![self.nav(a, "plan-menu").await?])
-                    .await?;
+                self.continue_setup(a, None).await?;
+                if let Some(id) = menu_message {
+                    let _ = self.telegram.clear_menu(a.chat_id, id).await;
+                }
             }
             "home" => self.menu(a, Menu::Home, menu_message).await?,
+            "continue-setup" => {
+                self.continue_setup(a, None).await?;
+                if let Some(id) = menu_message {
+                    let _ = self.telegram.clear_menu(a.chat_id, id).await;
+                }
+            }
+            name if name.starts_with("setup-") => {
+                self.setup_callback(a, &action, menu_message).await?
+            }
             "plan-menu" => self.menu(a, Menu::Plan, menu_message).await?,
             "settings" => self.menu(a, Menu::Settings, menu_message).await?,
             "language" => self.menu(a, Menu::Language, menu_message).await?,
@@ -458,10 +523,14 @@ impl BotUi {
                 a.locale = action.name[5..].into();
                 self.menu(&a, Menu::Language, menu_message).await?;
             }
-            "checkin" | "stop" | "resume" => {
+            "stop" => {
+                self.stop_review(a, plan.ok_or(Error::InvalidInput)?, None, menu_message)
+                    .await?
+            }
+            "checkin" | "stop-confirmed" | "resume" => {
                 let (op, key) = match action.name.as_str() {
                     "checkin" => (Control::CheckIn, "checked-in"),
-                    "stop" => (Control::Stop, "stopped"),
+                    "stop-confirmed" => (Control::Stop, "stopped"),
                     _ => (Control::Rearm, "armed"),
                 };
                 self.engine
@@ -482,14 +551,18 @@ impl BotUi {
                     .engine
                     .invite_with_id(a.id, plan.ok_or(Error::InvalidInput)?, action.id)
                     .await?;
-                self.text(
+                self.screen(
                     a,
                     &format!(
                         "https://t.me/{}?start=invite_{}",
                         self.username,
                         id.simple()
                     ),
-                    vec![self.back(a, "plan-menu").await?],
+                    vec![
+                        self.button(a, "participants", None, plan, true, &tr(&a.locale, "back"))
+                            .await?,
+                    ],
+                    menu_message,
                 )
                 .await?;
             }
@@ -501,12 +574,15 @@ impl BotUi {
                         target.ok_or(Error::InvalidInput)?,
                     )
                     .await?;
-                self.say(a, "confirmed", vec![self.back(a, "plan-menu").await?])
+                self.person_confirmed(a, plan.unwrap(), target.unwrap(), menu_message)
                     .await?;
             }
             "new-secret" => {
-                self.start_draft(a, plan.ok_or(Error::InvalidInput)?, menu_message)
+                self.start_draft(a, plan.ok_or(Error::InvalidInput)?, None)
                     .await?;
+                if let Some(id) = menu_message {
+                    let _ = self.telegram.clear_menu(a.chat_id, id).await;
+                }
             }
             name if name.starts_with("draft:") => {
                 self.draft_callback(a, &action, menu_message).await?;
@@ -526,6 +602,13 @@ impl BotUi {
                     )
                     .await?;
                 self.delete_callback(a, c).await?;
+                let (_, owned) = self.engine.own_plan(a.id).await?;
+                if owned.state == domain::PlanState::Setup {
+                    match self.continue_setup(a, None).await {
+                        Ok(()) | Err(Error::RateLimited | Error::MessageUnavailable) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
             }
             "ack-claim" => {
                 self.engine
@@ -692,6 +775,20 @@ impl BotUi {
             a.chat_id,
             m["message_id"].as_i64().ok_or(Error::InvalidInput)?,
         );
+        // Reply-keyboard labels are navigation, including after a language switch;
+        // never interpret them as secret content or a code response.
+        for locale in crate::localization::LOCALES {
+            if text == tr(locale, "nav-home") || text == tr(locale, "nav-continue") {
+                self.engine
+                    .limit(&format!("action:{}", a.id), 30, 60)
+                    .await?;
+                return if text == tr(locale, "nav-home") {
+                    self.home(a).await
+                } else {
+                    self.continue_setup(a, None).await
+                };
+            }
+        }
         self.cleanup_sensitive_input(a, m, event).await?;
         if text.starts_with('/') {
             let mut words = text.split_whitespace();
@@ -712,6 +809,7 @@ impl BotUi {
             }
             match command {
                 "/start" => {
+                    self.install_navigation(a).await?;
                     if let Some(invite) = words.next().and_then(|w| w.strip_prefix("invite_")) {
                         self.invitation_screen(
                             a,
@@ -720,13 +818,25 @@ impl BotUi {
                         )
                         .await?;
                     } else {
-                        self.home(a).await?;
+                        let view = self.engine.overview(a.id).await?;
+                        if view
+                            .own
+                            .is_some_and(|p| p.state == domain::PlanState::Setup)
+                        {
+                            self.continue_setup(a, None).await?;
+                        } else {
+                            self.home(a).await?;
+                        }
                     }
                 }
-                "/stop" | "/checkin" | "/resume" => {
+                "/continue" => self.continue_setup(a, None).await?,
+                "/stop" => {
+                    let (_, plan) = self.engine.own_plan(a.id).await?;
+                    self.stop_review(a, plan.id, None, None).await?;
+                }
+                "/checkin" | "/resume" => {
                     let (_, plan) = self.engine.own_plan(a.id).await?;
                     let (op, key) = match command {
-                        "/stop" => (Control::Stop, "stopped"),
                         "/checkin" => (Control::CheckIn, "checked-in"),
                         _ => (Control::Rearm, "armed"),
                     };
@@ -738,6 +848,7 @@ impl BotUi {
                     }
                 }
                 "/recover" | "/recoverstop" => {
+                    self.suspend_draft_question(a).await?;
                     if let Some((command, key)) = recovery_submission(text) {
                         return self
                             .recover_key(a, key, command == "/recoverstop", event)
@@ -756,8 +867,12 @@ impl BotUi {
                     .await?;
                     self.say(a, "recovery-prompt", vec![]).await?;
                 }
-                "/guardians" => self.guardians(a).await?,
+                "/guardians" => {
+                    self.suspend_draft_question(a).await?;
+                    self.guardians(a).await?;
+                }
                 "/help" => {
+                    self.suspend_draft_question(a).await?;
                     self.screen(
                         a,
                         &tr(&a.locale, "help-text"),
@@ -772,6 +887,7 @@ impl BotUi {
                 }
                 "/settings" => self.menu(a, Menu::Settings, None).await?,
                 "/status" => {
+                    self.suspend_draft_question(a).await?;
                     let (_, plan) = self.engine.own_plan(a.id).await?;
                     self.status(a, plan.id).await?;
                 }
@@ -784,7 +900,14 @@ impl BotUi {
                 .limit(&format!("action:{}", a.id), 30, 60)
                 .await?;
         }
-        let mut d = self.load_dialog(a).await?;
+        let mut d = match self.load_dialog(a).await {
+            Ok(d) => d,
+            Err(Error::NotFound | Error::Rule(RuleError::Expired | RuleError::StaleAction)) => {
+                self.say(a, "setup-use-buttons", vec![]).await?;
+                return self.continue_setup(a, None).await;
+            }
+            Err(error) => return Err(error),
+        };
         // Navigation can close a sensitive prompt while retaining a draft. A late
         // credential reply must never become draft content or a private label.
         if (text.trim_start().starts_with("R1.")
@@ -793,7 +916,21 @@ impl BotUi {
         {
             return Err(RuleError::StaleAction.into());
         }
-        match d.step.as_str() {
+        if d.draft_id.is_some() && d.reply_to.is_none() {
+            self.say(a, "setup-use-buttons", vec![]).await?;
+            return self.render_draft(a, &d, None).await;
+        }
+        let input_step = if d.step == "builder" {
+            if m["document"].is_object() {
+                "file"
+            } else {
+                "text"
+            }
+        } else {
+            d.step.as_str()
+        }
+        .to_owned();
+        match input_step.as_str() {
             "label" => {
                 self.engine
                     .set_label(
@@ -803,7 +940,8 @@ impl BotUi {
                         text,
                     )
                     .await?;
-                self.menu(a, Menu::Home, None).await?;
+                self.label_saved(a, d.plan_id.unwrap(), d.case_id.unwrap())
+                    .await?;
             }
             "timezone" => {
                 let Some(offset) = workspace::parse_offset(text) else {
@@ -819,7 +957,7 @@ impl BotUi {
                 if text.is_empty() {
                     return Err(Error::InvalidInput);
                 }
-                let block = match d.step.as_str() {
+                let block = match input_step.as_str() {
                     "text" => Block::Text { text: text.into() },
                     "copyable" => Block::Copyable { text: text.into() },
                     _ => Block::Spoiler { text: text.into() },
@@ -888,12 +1026,12 @@ impl BotUi {
                     d.plan_id,
                     &DraftSession {
                         id: d.id,
-                        dialog: d,
+                        dialog: d.clone(),
                     },
                 )
                 .await?;
                 tx.commit().await?;
-                self.say(a, "file-received", vec![]).await?;
+                self.render_draft(a, &d, None).await?;
             }
             "file-pending" => {
                 self.say(a, "awaiting-file", vec![]).await?;
@@ -969,6 +1107,10 @@ impl BotUi {
             "recover" | "recoverstop" => {
                 self.recover_key(a, text, d.step == "recoverstop", event)
                     .await?;
+            }
+            _ if d.draft_id.is_some() => {
+                self.say(a, "setup-use-buttons", vec![]).await?;
+                self.render_draft(a, &d, None).await?;
             }
             _ => return Err(Error::InvalidInput),
         }
@@ -1134,7 +1276,7 @@ impl BotUi {
                     let mut tx = self.engine.db.begin().await?;
                     let prompt_open = tx.get(Kind::Dialog, a.id).await?.is_some();
                     tx.commit().await?;
-                    if !prompt_open {
+                    if !prompt_open && d.reply_to.is_some() {
                         self.render_draft(&a, &d, None).await?;
                     }
                 }
@@ -1279,7 +1421,33 @@ impl BotUi {
                 .await?,
             );
         } else if matches!(&job.task, Task::Notice { .. }) {
-            match self.nav(&account, "home").await {
+            let destination = match key {
+                "participant-joined" => Some(("setup-people", "setup-check-people")),
+                "secret-armed" => Some(("setup-ready", "setup-check-readiness")),
+                _ => None,
+            };
+            let button = if let Some((action, label)) = destination
+                && let Some(plan) = job.plan_id
+                && self
+                    .engine
+                    .overview(account.id)
+                    .await?
+                    .own
+                    .is_some_and(|p| p.id == plan)
+            {
+                self.button(
+                    &account,
+                    action,
+                    None,
+                    Some(plan),
+                    true,
+                    &tr(&account.locale, label),
+                )
+                .await
+            } else {
+                self.nav(&account, "home").await
+            };
+            match button {
                 Ok(button) => buttons.push(button),
                 Err(Error::RateLimited) => {}
                 Err(error) => return Err(error),

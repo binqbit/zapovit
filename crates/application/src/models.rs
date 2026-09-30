@@ -17,6 +17,9 @@ pub struct Account {
     pub telegram_id: i64,
     pub chat_id: i64,
     pub locale: String,
+    /// Telegram display metadata never grants authority and is encrypted at rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<Envelope>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -12,6 +12,125 @@ pub(super) enum Menu {
 }
 
 impl BotUi {
+    pub(super) async fn suspend_draft_question(&self, a: &Account) -> Result<()> {
+        let mut tx = self.engine.db.begin().await?;
+        tx.lock(Kind::DraftSession, a.id).await?;
+        let previous = if let Some(raw) = tx.get(Kind::DraftSession, a.id).await? {
+            let mut session: DraftSession =
+                serde_json::from_value(raw).map_err(|_| Error::Internal)?;
+            let previous = session.dialog.reply_to.take();
+            if previous.is_some() {
+                put(&mut *tx, session.dialog.plan_id, &session).await?;
+            }
+            previous
+        } else {
+            None
+        };
+        tx.commit().await?;
+        if let Some(previous) = previous {
+            let _ = self.telegram.clear_menu(a.chat_id, previous).await;
+        }
+        Ok(())
+    }
+    pub(super) async fn install_navigation(&self, a: &Account) -> Result<()> {
+        let _ = self
+            .telegram
+            .navigation_keyboard(
+                a.chat_id,
+                &tr(&a.locale, "navigation-hint"),
+                &tr(&a.locale, "nav-home"),
+                &tr(&a.locale, "nav-continue"),
+            )
+            .await;
+        Ok(())
+    }
+    pub(super) async fn continue_setup(&self, a: &Account, message: Option<i64>) -> Result<()> {
+        let mut tx = self.engine.db.begin().await?;
+        tx.remove(Kind::Dialog, a.id).await?;
+        tx.commit().await?;
+        if let Some(draft) = self.active_draft(a).await? {
+            return self.render_draft(a, &draft, None).await;
+        }
+        let view = self.engine.overview(a.id).await?;
+        let Some(plan) = view.own else {
+            return self.menu(a, Menu::Home, message).await;
+        };
+        match plan.next_action {
+            NextAction::SaveRecovery => self.setup_recovery(a, plan.id).await,
+            NextAction::ResolveRecovery => self.menu(a, Menu::Recovery, message).await,
+            NextAction::PreparePeople => self.setup_people(a, plan.id, None).await,
+            NextAction::CreateSecret if plan.can_create_draft => {
+                self.start_draft(a, plan.id, None).await
+            }
+            NextAction::CreateSecret => self.secrets_page(a, plan.id, 0, message).await,
+            NextAction::AwaitCodes | NextAction::ResumePlan => {
+                self.setup_status(a, plan.id, None).await
+            }
+            _ => self.menu(a, Menu::Home, message).await,
+        }
+    }
+    pub(super) async fn stop_review(
+        &self,
+        a: &Account,
+        plan: Id,
+        secret: Option<Id>,
+        message: Option<i64>,
+    ) -> Result<()> {
+        self.suspend_draft_question(a).await?;
+        let mut text = tr(
+            &a.locale,
+            if secret.is_some() {
+                "stop-secret-question"
+            } else {
+                "stop-question"
+            },
+        );
+        if let Some(id) = secret {
+            let view = self.engine.overview(a.id).await?;
+            let secret = view
+                .own
+                .as_ref()
+                .filter(|p| p.id == plan)
+                .and_then(|p| p.secrets.iter().find(|s| s.id == id))
+                .ok_or(RuleError::AccessDenied)?;
+            text.push_str(&format!(
+                "\n\n{}: {}",
+                tr(&a.locale, "secret-label"),
+                secret
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| id.simple().to_string()[..8].to_owned())
+            ));
+        }
+        let confirm = if secret.is_some() {
+            "stop-secret-confirmed"
+        } else {
+            "stop-confirmed"
+        };
+        let confirm = self
+            .button(
+                a,
+                confirm,
+                secret,
+                Some(plan),
+                true,
+                &tr(&a.locale, "confirm-stop"),
+            )
+            .await?;
+        let confirmation = Id::parse_str(&confirm.1).map_err(|_| Error::Internal)?;
+        let cancel = self
+            .button(
+                a,
+                "stop-cancel",
+                Some(confirmation),
+                Some(plan),
+                true,
+                &tr(&a.locale, "cancel"),
+            )
+            .await?;
+        self.screen_grid(a, &text, vec![vec![confirm], vec![cancel]], message)
+            .await
+    }
     pub(super) async fn nav(&self, a: &Account, name: &str) -> Result<(String, String)> {
         self.b(a, name, None, None, false).await
     }
@@ -20,6 +139,7 @@ impl BotUi {
             .await
     }
     pub(super) async fn menu(&self, a: &Account, menu: Menu, message: Option<i64>) -> Result<()> {
+        self.suspend_draft_question(a).await?;
         // A sensitive prompt is cancelled on navigation; the separate draft session survives.
         let mut tx = self.engine.db.begin().await?;
         tx.remove(Kind::Dialog, a.id).await?;
@@ -51,36 +171,59 @@ impl BotUi {
                             }
                             _ => "checkin",
                         };
-                        rows.push(vec![self.b(a, next, None, Some(plan.id), true).await?]);
+                        rows.push(vec![
+                            self.button(
+                                a,
+                                if plan.state == domain::PlanState::Setup {
+                                    "continue-setup"
+                                } else {
+                                    next
+                                },
+                                None,
+                                Some(plan.id),
+                                true,
+                                &tr(&a.locale, next),
+                            )
+                            .await?,
+                        ]);
                     }
-                    rows.push(vec![
-                        self.button(
-                            a,
-                            "secrets",
-                            None,
-                            Some(plan.id),
-                            true,
-                            &format!("{} · {}", tr(&a.locale, "secrets"), plan.secrets.len()),
-                        )
-                        .await?,
-                        self.button(
-                            a,
-                            "participants",
-                            None,
-                            Some(plan.id),
-                            true,
-                            &format!(
-                                "{} · {}",
-                                tr(&a.locale, "participants"),
-                                plan.confirmed_people
-                            ),
-                        )
-                        .await?,
-                    ]);
-                    rows.push(vec![
-                        self.nav(a, "guardians").await?,
-                        self.nav(a, "settings").await?,
-                    ]);
+                    if plan.state != domain::PlanState::Setup {
+                        rows.push(vec![
+                            self.button(
+                                a,
+                                "secrets",
+                                None,
+                                Some(plan.id),
+                                true,
+                                &format!("{} · {}", tr(&a.locale, "secrets"), plan.secrets.len()),
+                            )
+                            .await?,
+                            self.button(
+                                a,
+                                "participants",
+                                None,
+                                Some(plan.id),
+                                true,
+                                &format!(
+                                    "{} · {}",
+                                    tr(&a.locale, "participants"),
+                                    plan.confirmed_people
+                                ),
+                            )
+                            .await?,
+                        ]);
+                        rows.push(vec![
+                            self.nav(a, "guardians").await?,
+                            self.nav(a, "settings").await?,
+                        ]);
+                    } else {
+                        let mut navigation = Vec::new();
+                        if !overview.guardian.is_empty() || !overview.receiving.is_empty() {
+                            navigation.push(self.nav(a, "guardians").await?);
+                        }
+                        navigation.push(self.nav(a, "settings").await?);
+                        rows.push(navigation);
+                    }
                     rows.push(vec![self.b(a, "stop", None, Some(plan.id), true).await?]);
                     self.plan_text(a, plan).await?
                 } else {
@@ -100,6 +243,12 @@ impl BotUi {
                 }
             }
             Menu::Settings => {
+                if let Some(plan) = &overview.own {
+                    rows.push(vec![
+                        self.b(a, "participants", None, Some(plan.id), true).await?,
+                        self.b(a, "secrets", None, Some(plan.id), true).await?,
+                    ]);
+                }
                 rows.push(vec![
                     self.nav(a, "language").await?,
                     self.nav(a, "timezone").await?,
@@ -280,16 +429,34 @@ impl BotUi {
         rows: Vec<Vec<(String, String)>>,
         message: Option<i64>,
     ) -> Result<()> {
+        self.screen_grid_id(a, text, rows, message)
+            .await
+            .map(|_| ())
+    }
+    pub(super) async fn screen_grid_id(
+        &self,
+        a: &Account,
+        text: &str,
+        rows: Vec<Vec<(String, String)>>,
+        message: Option<i64>,
+    ) -> Result<i64> {
         let danger = [
             tr(&a.locale, "stop"),
             tr(&a.locale, "stop-secret"),
             tr(&a.locale, "delete-confirmed"),
             tr(&a.locale, "discard-confirmed"),
+            tr(&a.locale, "confirm-stop"),
         ];
         let primary = [
             tr(&a.locale, "checkin"),
             tr(&a.locale, "create"),
             tr(&a.locale, "continue-draft"),
+            tr(&a.locale, "continue-setup"),
+            tr(&a.locale, "draft-next"),
+            tr(&a.locale, "confirm-person"),
+            tr(&a.locale, "setup-next"),
+            tr(&a.locale, "setup-confirm-person"),
+            tr(&a.locale, "setup-enable"),
         ];
         let rows: Vec<Vec<MenuButton>> = rows
             .into_iter()
@@ -314,7 +481,7 @@ impl BotUi {
                 .menu_message(a.chat_id, Some(id), text, rows.clone())
                 .await
             {
-                SendResult::Sent(_) => return Ok(()),
+                SendResult::Sent(_) => return Ok(id),
                 SendResult::Permanent => {}
                 _ => return Err(Error::MessageUnavailable),
             }
@@ -324,7 +491,7 @@ impl BotUi {
             .menu_message(a.chat_id, None, text, rows)
             .await
         {
-            SendResult::Sent(_) => Ok(()),
+            SendResult::Sent(id) => Ok(id),
             _ => Err(Error::MessageUnavailable),
         }
     }

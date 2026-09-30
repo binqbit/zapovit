@@ -16,11 +16,34 @@ fn secret_label(a: &Account, secret: &SecretOverview) -> String {
         )
     })
 }
-fn contact_label(a: &Account, person: &ContactView) -> String {
+/// Keep compact Telegram labels bounded without splitting a Unicode scalar.
+/// UTF-16 units also match Telegram's native entity offsets.
+pub(super) fn short_label(text: &str) -> String {
+    const LIMIT: usize = 60;
+    if text.encode_utf16().count() <= LIMIT {
+        return text.to_owned();
+    }
+    let mut result = String::new();
+    let mut units = 0;
+    for ch in text.chars() {
+        if units + ch.len_utf16() > LIMIT - 1 {
+            break;
+        }
+        result.push(ch);
+        units += ch.len_utf16();
+    }
+    result.push('…');
+    result
+}
+fn contact_name(a: &Account, person: &ContactView) -> String {
     person
         .label
         .clone()
+        .or_else(|| person.display_name.clone())
         .unwrap_or_else(|| format!("{} · {}", tr(&a.locale, "person-label"), person.telegram_id))
+}
+pub(super) fn contact_label(a: &Account, person: &ContactView) -> String {
+    short_label(&contact_name(a, person))
 }
 fn page_start(page: usize, length: usize) -> usize {
     page.min(length.saturating_sub(1) / PAGE) * PAGE
@@ -281,17 +304,7 @@ impl BotUi {
                 secret.unknown_parts
             ));
         }
-        let mut rows = vec![vec![
-            self.button(
-                a,
-                "rename-secret",
-                Some(id),
-                Some(plan.id),
-                true,
-                &tr(l, "rename"),
-            )
-            .await?,
-        ]];
+        let mut rows = Vec::new();
         if secret.can_stop {
             rows.push(vec![
                 self.b(a, "stop-secret", Some(id), Some(plan.id), true)
@@ -304,12 +317,46 @@ impl BotUi {
                     .await?,
             ]);
         }
-        if let Some(draft) = self.active_draft(a).await? {
-            rows.push(vec![
-                self.draft_button(a, &draft, "continue", "continue-draft")
-                    .await?,
-            ]);
-        } else if plan.can_create_draft {
+        rows.push(vec![
+            self.b(a, "secret-options", Some(id), Some(plan.id), true)
+                .await?,
+        ]);
+        rows.push(vec![
+            self.button(a, "secrets", None, Some(plan.id), true, &tr(l, "back"))
+                .await?,
+        ]);
+        self.screen_grid(a, &text, rows, message).await
+    }
+    async fn secret_options(
+        &self,
+        a: &Account,
+        plan: Id,
+        id: Id,
+        message: Option<i64>,
+    ) -> Result<()> {
+        let view = self.engine.overview(a.id).await?;
+        let plan = view
+            .own
+            .as_ref()
+            .filter(|p| p.id == plan)
+            .ok_or(RuleError::AccessDenied)?;
+        let secret = plan
+            .secrets
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or(RuleError::AccessDenied)?;
+        let mut rows = vec![vec![
+            self.button(
+                a,
+                "rename-secret",
+                Some(id),
+                Some(plan.id),
+                true,
+                &tr(&a.locale, "rename"),
+            )
+            .await?,
+        ]];
+        if plan.can_create_draft {
             rows.push(vec![
                 self.button(
                     a,
@@ -317,7 +364,7 @@ impl BotUi {
                     None,
                     Some(plan.id),
                     true,
-                    &tr(l, "create-another"),
+                    &tr(&a.locale, "create-another"),
                 )
                 .await?,
             ]);
@@ -326,11 +373,27 @@ impl BotUi {
             self.b(a, "delete", Some(id), Some(plan.id), true).await?,
         ]);
         rows.push(vec![
-            self.button(a, "secrets", None, Some(plan.id), true, &tr(l, "back"))
-                .await?,
-            self.nav(a, "home").await?,
+            self.button(
+                a,
+                "secret-card",
+                Some(id),
+                Some(plan.id),
+                true,
+                &tr(&a.locale, "back"),
+            )
+            .await?,
         ]);
-        self.screen_grid(a, &text, rows, message).await
+        self.screen_grid(
+            a,
+            &format!(
+                "{}\n\n{}",
+                secret_label(a, secret),
+                tr(&a.locale, "secret-options")
+            ),
+            rows,
+            message,
+        )
+        .await
     }
     pub(super) async fn people_page(
         &self,
@@ -339,7 +402,19 @@ impl BotUi {
         page: usize,
         message: Option<i64>,
     ) -> Result<()> {
-        let people = self.engine.contacts(a.id, plan).await?;
+        let mut people = self.engine.contacts(a.id, plan).await?;
+        people.sort_by_key(|p| (p.archived, p.confirmed));
+        let start = page_start(page, people.len());
+        futures_util::future::join_all(
+            people
+                .iter()
+                .skip(start)
+                .take(PAGE)
+                .map(|p| self.refresh_person_display(p)),
+        )
+        .await;
+        let mut people = self.engine.contacts(a.id, plan).await?;
+        people.sort_by_key(|p| (p.archived, p.confirmed));
         let start = page_start(page, people.len());
         let mut rows = Vec::new();
         for person in people.iter().skip(start).take(PAGE) {
@@ -375,29 +450,88 @@ impl BotUi {
         if !pager.is_empty() {
             rows.push(pager);
         }
-        rows.push(vec![
-            self.b(a, "invite", None, Some(plan), true).await?,
-            self.b(a, "invitations", None, Some(plan), true).await?,
-        ]);
+        if people.iter().any(|p| p.confirmed && !p.archived) {
+            rows.push(vec![
+                self.b(a, "continue-setup", None, Some(plan), true).await?,
+            ]);
+        }
+        rows.push(vec![self.b(a, "invite", None, Some(plan), true).await?]);
+        if !self.engine.invitations(a.id, plan).await?.is_empty() {
+            rows.push(vec![
+                self.b(a, "invitations", None, Some(plan), true).await?,
+            ]);
+        }
         rows.push(vec![self.back(a, "home").await?]);
         let text = if people.is_empty() {
             tr(&a.locale, "no-people")
         } else {
             tr(&a.locale, "people-explained")
         };
-        self.screen_grid(a, &text, rows, message).await
+        self.screen_grid(
+            a,
+            &format!("{}\n\n{text}", tr(&a.locale, "participants")),
+            rows,
+            message,
+        )
+        .await
     }
-    async fn person_card(&self, a: &Account, plan: Id, id: Id, message: Option<i64>) -> Result<()> {
+    pub(super) async fn refresh_person_display(&self, person: &ContactView) {
+        if person.display_name.is_some()
+            || self
+                .engine
+                .limit(&format!("display-lookup:{}", person.account_id), 1, DAY)
+                .await
+                .is_err()
+            || self
+                .engine
+                .limit("display-lookup:global", 30, 60)
+                .await
+                .is_err()
+        {
+            return;
+        }
+        if let Some(identity) = self.telegram.chat_identity(person.telegram_id).await {
+            let _ = self
+                .engine
+                .update_account_display(
+                    person.account_id,
+                    Some(&identity.first_name),
+                    identity.last_name.as_deref(),
+                    identity.username.as_deref(),
+                )
+                .await;
+        }
+    }
+    pub(super) async fn person_card(
+        &self,
+        a: &Account,
+        plan: Id,
+        id: Id,
+        message: Option<i64>,
+    ) -> Result<()> {
         let people = self.engine.contacts(a.id, plan).await?;
-        let p = people
+        let person = people
             .iter()
             .find(|p| p.id == id)
             .ok_or(RuleError::AccessDenied)?;
+        self.refresh_person_display(person).await;
+        let mut people = self.engine.contacts(a.id, plan).await?;
+        people.sort_by_key(|p| (p.archived, p.confirmed));
+        let position = people
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or(RuleError::AccessDenied)?;
+        let p = &people[position];
         let l = &a.locale;
-        let mut text = format!(
-            "{}\nTelegram ID: {}\n{}",
-            contact_label(a, p),
-            p.telegram_id,
+        let mut text = contact_label(a, p);
+        if let Some(name) = &p.username {
+            text.push_str(&format!("\n@{name}"));
+        }
+        if !p.confirmed {
+            text.push_str(&format!("\nTelegram ID: {}", p.telegram_id));
+        }
+        text.push_str(&format!(
+            "\n\n{}",
             tr(
                 l,
                 if p.archived {
@@ -405,12 +539,114 @@ impl BotUi {
                 } else if p.confirmed {
                     "contact-confirmed"
                 } else {
-                    "contact-pending"
+                    "confirm-person-explained"
                 }
             )
-        );
+        ));
+        let mut rows = Vec::new();
+        if !p.confirmed && !p.archived {
+            rows.push(vec![
+                self.b(a, "confirm-person", Some(id), Some(plan), true)
+                    .await?,
+            ]);
+            rows.push(vec![
+                self.b(a, "reject-person", Some(id), Some(plan), true)
+                    .await?,
+            ]);
+        } else {
+            if p.confirmed && !p.archived {
+                rows.push(vec![
+                    self.b(a, "continue-setup", None, Some(plan), true).await?,
+                ]);
+            }
+            rows.push(vec![
+                self.b(a, "person-details", Some(id), Some(plan), true)
+                    .await?,
+            ]);
+        }
+        rows.push(vec![
+            self.button(
+                a,
+                &format!("people-page.{}", position / PAGE),
+                None,
+                Some(plan),
+                true,
+                &tr(l, "back"),
+            )
+            .await?,
+        ]);
+        self.screen_grid(a, &text, rows, message).await
+    }
+    pub(super) async fn person_confirmed(
+        &self,
+        a: &Account,
+        plan: Id,
+        id: Id,
+        message: Option<i64>,
+    ) -> Result<()> {
+        let people = self.engine.contacts(a.id, plan).await?;
+        let person = people
+            .iter()
+            .find(|p| p.id == id)
+            .ok_or(RuleError::AccessDenied)?;
+        self.screen_grid(
+            a,
+            &format!(
+                "✅ {}\n\n{}",
+                contact_label(a, person),
+                tr(&a.locale, "person-confirmed-next")
+            ),
+            vec![
+                vec![self.b(a, "continue-setup", None, Some(plan), true).await?],
+                vec![
+                    self.button(
+                        a,
+                        "participants",
+                        None,
+                        Some(plan),
+                        true,
+                        &tr(&a.locale, "back-to-people"),
+                    )
+                    .await?,
+                ],
+            ],
+            message,
+        )
+        .await
+    }
+    pub(super) async fn label_saved(&self, a: &Account, plan: Id, target: Id) -> Result<()> {
+        let mut tx = self.engine.db.begin().await?;
+        tx.remove(Kind::Dialog, a.id).await?;
+        let person = tx.get(Kind::Participant, target).await?.is_some();
+        let draft = tx.get(Kind::Draft, target).await?.is_some();
+        tx.commit().await?;
+        if person {
+            self.person_card(a, plan, target, None).await
+        } else if draft {
+            self.continue_setup(a, None).await
+        } else {
+            self.secret_card(a, target, None).await
+        }
+    }
+    async fn person_details(
+        &self,
+        a: &Account,
+        plan: Id,
+        id: Id,
+        message: Option<i64>,
+    ) -> Result<()> {
+        let people = self.engine.contacts(a.id, plan).await?;
+        let p = people
+            .iter()
+            .find(|p| p.id == id)
+            .ok_or(RuleError::AccessDenied)?;
+        let l = &a.locale;
+        let mut text = format!("{}\n\nTelegram ID: {}", contact_name(a, p), p.telegram_id);
+        if let Some(name) = &p.username {
+            text.push_str(&format!("\n@{name}"));
+        }
         if p.delivery_failed {
-            text.push_str(&format!("\n{}", tr(l, "contact-delivery-failed")));
+            text.push_str(&format!("\n\n{}", tr(l, "contact-delivery-failed")));
         }
         if !p.dependent_secrets.is_empty() {
             text.push_str(&format!(
@@ -431,14 +667,7 @@ impl BotUi {
             )
             .await?,
         ]];
-        if !p.confirmed && !p.archived {
-            rows.push(vec![
-                self.b(a, "confirm-person", Some(id), Some(plan), true)
-                    .await?,
-                self.b(a, "reject-person", Some(id), Some(plan), true)
-                    .await?,
-            ]);
-        } else if !p.archived {
+        if !p.archived {
             rows.push(vec![
                 self.b(a, "archive-person", Some(id), Some(plan), true)
                     .await?,
@@ -448,9 +677,8 @@ impl BotUi {
             rows.push(vec![self.b(a, "secrets", None, Some(plan), true).await?]);
         }
         rows.push(vec![
-            self.button(a, "participants", None, Some(plan), true, &tr(l, "back"))
+            self.button(a, "person-card", Some(id), Some(plan), true, &tr(l, "back"))
                 .await?,
-            self.nav(a, "home").await?,
         ]);
         self.screen_grid(a, &text, rows, message).await
     }
@@ -549,7 +777,11 @@ impl BotUi {
                 "{}\n\n{}: {}\n{}: {}",
                 tr(&a.locale, "invitation-explained"),
                 tr(&a.locale, "owner-label"),
-                invite.owner_telegram_id,
+                invite
+                    .owner_display_name
+                    .as_deref()
+                    .map(short_label)
+                    .unwrap_or_else(|| invite.owner_telegram_id.to_string()),
                 tr(&a.locale, "invitation-until"),
                 self.date(a, invite.expires_at).await?
             )
@@ -587,7 +819,10 @@ impl BotUi {
                     false,
                     &format!(
                         "{} · {} · {}",
-                        g.owner_telegram_id,
+                        g.owner_display_name
+                            .as_deref()
+                            .map(short_label)
+                            .unwrap_or_else(|| g.owner_telegram_id.to_string()),
                         reference(g.secret_id),
                         tr(&a.locale, key)
                     ),
@@ -637,7 +872,10 @@ impl BotUi {
         let mut text = format!(
             "{}: {}\n{}: {}\n{}: {}",
             tr(l, "owner-label"),
-            g.owner_telegram_id,
+            g.owner_display_name
+                .as_deref()
+                .map(short_label)
+                .unwrap_or_else(|| g.owner_telegram_id.to_string()),
             tr(l, "secret-reference"),
             reference(id),
             tr(l, "status"),
@@ -751,7 +989,10 @@ impl BotUi {
                     false,
                     &format!(
                         "{} · {} · {}/{}",
-                        r.owner_telegram_id,
+                        r.owner_display_name
+                            .as_deref()
+                            .map(short_label)
+                            .unwrap_or_else(|| r.owner_telegram_id.to_string()),
                         reference(r.secret_id),
                         r.parts
                             .iter()
@@ -813,7 +1054,10 @@ impl BotUi {
         let mut text = format!(
             "{}: {}\n{}: {}\n\n{}: {} / {}\n{}",
             tr(l, "owner-label"),
-            r.owner_telegram_id,
+            r.owner_display_name
+                .as_deref()
+                .map(short_label)
+                .unwrap_or_else(|| r.owner_telegram_id.to_string()),
             tr(l, "secret-reference"),
             reference(id),
             tr(l, "parts-sent"),
@@ -975,7 +1219,44 @@ impl BotUi {
     ) -> Result<bool> {
         let plan = action.plan_id;
         let target = action.target;
+        if matches!(
+            action.name.as_str(),
+            "person-card" | "person-details" | "secret-card" | "secret-options"
+        ) {
+            let mut tx = self.engine.db.begin().await?;
+            tx.remove(Kind::Dialog, a.id).await?;
+            tx.commit().await?;
+        }
         match action.name.as_str() {
+            "stop-cancel" => {
+                let mut tx = self.engine.db.begin().await?;
+                let mut confirmation: Action =
+                    get(&mut *tx, target.ok_or(Error::InvalidInput)?).await?;
+                if confirmation.actor_id != a.id
+                    || confirmation.plan_id != plan
+                    || !matches!(
+                        confirmation.name.as_str(),
+                        "stop-confirmed" | "stop-secret-confirmed"
+                    )
+                {
+                    return Err(RuleError::AccessDenied.into());
+                }
+                confirmation.used = true;
+                put(&mut *tx, plan, &confirmation).await?;
+                tx.commit().await?;
+                let result = if let Some(id) = confirmation.target {
+                    self.secret_card(a, id, message).await
+                } else {
+                    self.menu(a, Menu::Home, message).await
+                };
+                match result {
+                    Err(Error::Rule(RuleError::QuotaExceeded) | Error::RateLimited) => {
+                        self.screen(a, &tr(&a.locale, "stop-cancelled"), vec![], message)
+                            .await?
+                    }
+                    result => result?,
+                }
+            }
             "secret-card" => {
                 self.secret_card(a, target.ok_or(Error::InvalidInput)?, message)
                     .await?
@@ -989,6 +1270,24 @@ impl BotUi {
                 )
                 .await?
             }
+            "secret-options" => {
+                self.secret_options(
+                    a,
+                    plan.ok_or(Error::InvalidInput)?,
+                    target.ok_or(Error::InvalidInput)?,
+                    message,
+                )
+                .await?;
+            }
+            "person-details" => {
+                self.person_details(
+                    a,
+                    plan.ok_or(Error::InvalidInput)?,
+                    target.ok_or(Error::InvalidInput)?,
+                    message,
+                )
+                .await?;
+            }
             "rename-secret" | "rename-person" => {
                 let mut d = self.dialog(a, "label", plan, None).await?;
                 d.case_id = target;
@@ -996,7 +1295,21 @@ impl BotUi {
                 self.screen(
                     a,
                     &tr(&a.locale, "label-prompt"),
-                    vec![self.back(a, "home").await?],
+                    vec![
+                        self.button(
+                            a,
+                            if action.name == "rename-person" {
+                                "person-details"
+                            } else {
+                                "secret-options"
+                            },
+                            target,
+                            plan,
+                            true,
+                            &tr(&a.locale, "back"),
+                        )
+                        .await?,
+                    ],
                     message,
                 )
                 .await?;
@@ -1134,9 +1447,13 @@ impl BotUi {
                 )
                 .await?;
             }
-            "stop-secret" | "resume-secret" => {
+            "stop-secret" => {
+                self.stop_review(a, plan.ok_or(Error::InvalidInput)?, target, message)
+                    .await?
+            }
+            "stop-secret-confirmed" | "resume-secret" => {
                 let id = target.ok_or(Error::InvalidInput)?;
-                let op = if action.name == "stop-secret" {
+                let op = if action.name == "stop-secret-confirmed" {
                     Control::StopSecret { secret_id: id }
                 } else {
                     Control::RearmSecret { secret_id: id }
@@ -1144,7 +1461,7 @@ impl BotUi {
                 self.engine
                     .control(a.id, plan.ok_or(Error::InvalidInput)?, action.id, op)
                     .await?;
-                if action.name == "stop-secret" {
+                if action.name == "stop-secret-confirmed" {
                     self.control_feedback(a, plan, action.id, "secret-stopped")
                         .await?;
                 } else {
@@ -1274,6 +1591,29 @@ fn format_date(at: i64, minutes: i16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compact_labels_bound_utf16_without_splitting_emoji() {
+        for text in ["Nadia Melnyk".to_owned(), "a".repeat(60), "😀".repeat(30)] {
+            assert_eq!(short_label(&text), text);
+        }
+        for text in [
+            "a".repeat(61),
+            "😀".repeat(31),
+            format!("{}😀bc", "a".repeat(57)),
+            format!("{}😀b", "a".repeat(58)),
+        ] {
+            let short = short_label(&text);
+            assert!(short.encode_utf16().count() <= 60);
+            let prefix = short.strip_suffix('…').unwrap();
+            assert!(text.starts_with(prefix));
+            assert!(prefix.len() < text.len());
+        }
+        assert_eq!(short_label(&"a".repeat(61)), format!("{}…", "a".repeat(59)));
+        assert_eq!(
+            short_label(&format!("{}😀bc", "a".repeat(57))),
+            format!("{}😀…", "a".repeat(57))
+        );
+    }
     #[test]
     fn utc_offsets_validate_boundaries_and_preserve_instant() {
         assert_eq!(parse_offset("UTC+05:45"), Some(345));
