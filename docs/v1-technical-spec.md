@@ -2,7 +2,7 @@
 
 Дата перевірки зовнішніх джерел: **6 вересня 2026 року**.
 
-Функціональний обсяг визначає [V1](v1.md). [Загальна концепція](concept.md) дає контекст майбутнього розвитку, але не додає функцій до цього релізу. Це специфікація реалізації; наведений стек ще не підтверджений спільною збіркою чи аудитом готового сервісу.
+Функціональний обсяг визначає [V1](v1.md). [Загальна концепція](concept.md) дає контекст майбутнього розвитку, але не додає функцій до цього релізу. Команди запуску реалізації наведено в [інструкції експлуатації](operations.md), результати перевірок і межі допуску — у [звіті перевірки](verification.md). Незалежний аудит готового сервісу залишається окремою умовою роботи з реальними секретами.
 
 ## 1. Основні рішення
 
@@ -13,6 +13,8 @@
 - **Прямі виклики всередині моноліту:** модулі викликають application use cases; фонові завдання потрібні лише для виконання за часом, тривалих операцій та доставки з обліком результату. Універсальна шина подій або інтерфейс майбутнього брокера не входять до V1.
 - **Argon2id перевіряє recovery-ключ; XChaCha20-Poly1305 шифрує дані.** Argon2 є функцією виведення ключа/password hashing, а не алгоритмом шифрування файлів. [RFC 9106](https://www.rfc-editor.org/rfc/rfc9106.html).
 - **Локалізація:** українська `uk` та англійська `en`; додавання інших мов — через ресурси й реєстр підтримуваних локалей.
+
+У повідомленнях і продуктових описах використовуємо формулювання «власник не має змоги самостійно керувати своїми даними». Неактивність — технічний стан відсутності підтверджень у встановлений строк; він запускає перевірку, але не встановлює причину недоступності. Guardian підтверджує запит на передачу з огляду на відомі йому обставини.
 
 Архітектура передбачає додавання адаптерів і політик виконання, але V1 реалізує лише незалежну передачу секретів після неактивності, підтверджень та очікування.
 
@@ -26,7 +28,7 @@
 | --- | --- | --- |
 | [Rust](https://blog.rust-lang.org/2026/09/03/Rust-1.98.1/) | 1.98.1, edition 2024 | Stable toolchain, зафіксований у rust-toolchain.toml. |
 | [Tokio](https://docs.rs/tokio/1.53.1/tokio/) | 1.53.1 | Async runtime, обмежена паралельність, завершення фонових задач. |
-| [teloxide](https://docs.rs/teloxide/0.17.0/teloxide/) / teloxide-core | 0.17.0 / 0.13.0 | Типи та методи Telegram, multipart, помилки. Лише всередині адаптера. |
+| [teloxide-core](https://docs.rs/teloxide-core/0.13.0/teloxide_core/) | 0.13.0 | Типи Telegram та entities всередині адаптера; HTTP й multipart через reqwest. Повний dispatcher teloxide не потрібний. |
 | [reqwest](https://docs.rs/reqwest/0.12.28/reqwest/) | 0.12.28 | Спільна з teloxide-core гілка HTTP-клієнта, rustls, явні timeouts. |
 | [SQLx](https://docs.rs/sqlx/0.9.0/sqlx/) / sqlx-cli | 0.9.0 | PostgreSQL, SQL-міграції, перевірка запитів, транзакції. |
 | [aws-sdk-s3](https://crates.io/crates/aws-sdk-s3/1.145.0) / [aws-credential-types](https://crates.io/crates/aws-credential-types/1.3.0) | 1.145.0 / 1.3.0 | Офіційний AWS SDK для локального S3 endpoint; explicit credentials, без залежності від AWS account. |
@@ -44,7 +46,7 @@
 
 Допоміжні пакети: serde 1.0.229, serde_json 1.0.151, uuid 1.26.0, time 0.3.55; для внутрішніх health endpoints — axum 0.8.9. Вони не визначають бізнес-контракти або криптографічний формат.
 
-Teloxide 0.17 описує Bot API 9.1, тоді як Telegram уже документує 10.3. Використовуваний V1 набір методів перевіряється контрактними тестами; повна підтримка найновішого API не припускається. `reqwest 0.12` обрано через залежність teloxide-core; `reqwest 0.13` не додається паралельно без потреби. Вбудоване PostgreSQL dialogue storage teloxide не використовується: воно тягне іншу гілку SQLx. [Залежності teloxide](https://crates.io/api/v1/crates/teloxide/0.17.0/dependencies).
+Використовуваний teloxide-core 0.13 описує Bot API 9.1, тоді як Telegram уже документує 10.3. Використовуваний V1 набір методів перевіряється контрактними тестами; повна підтримка найновішого API не припускається. `reqwest 0.12` обрано через залежність teloxide-core; `reqwest 0.13` не додається паралельно без потреби. Вбудоване PostgreSQL dialogue storage teloxide не використовується: воно тягне іншу гілку SQLx. [Залежності teloxide](https://crates.io/api/v1/crates/teloxide/0.17.0/dependencies).
 
 Garage обрано для невеликих зашифрованих файлів і простого автономного deployment. MinIO Community архівовано та більше не підтримується; актуальний AIStor Free потребує окремого license file. Garage підтримує потрібні S3 operations, але не повний AWS API: використовуються його власні bucket permissions, без IAM policies, ACL і bucket versioning. Це вибір за відповідністю нашим вимогам, а не твердження про найвищу швидкість або аудит усіх компонентів. Stable 2.4.0 опубліковано 6 вересня 2026; допуск залежить від наших contract/restore tests, не лише позначки stable. [MinIO](https://github.com/minio/minio), [AIStor licenses](https://docs.min.io/aistor/operations/licenses/), [Garage S3 compatibility](https://garagehq.deuxfleurs.fr/documentation/reference-manual/s3-compatibility/).
 
@@ -131,7 +133,7 @@ Domain не залежить від teloxide, SQLx, HTTP або конкретн
 | secret_versions | Plan ID, secret_epoch, незмінна політика, її digest, формат ciphertext, nonce, зашифровані блоки, стан готовності/видачі. |
 | secret_guardians | Guardian account, share index, verifier MAC та його key ID, підтвердження збереження коду. |
 | secret_recipients | Незмінний набір одержувачів, окремий від guardians. |
-| encrypted_objects | Невеликі тексти/draft-блоки/службові конверти: ciphertext BYTEA, nonce, key ID, TTL і власник об'єкта; без файлових payload. |
+| encrypted envelopes | Невеликі тексти/draft-блоки/службові конверти зберігаються в типізованих JSONB-записах відповідних сутностей: version, base64url ciphertext/nonce, key ID; TTL і scope у записі. Файлові payload залишаються в S3. |
 | file_objects / upload_attempts | Object ID/key, encrypted size, SHA-256 ciphertext, crypto format, draft revision, operation ID, lease та стан Pending/Ready/Attached/DeletePending/Deleted. |
 | dialogs | Крок конструктора або поточної операції, посилання на draft; без відкритого секрету. |
 | release_cases | Secret version, стан, generation, quorum_at, release_at, TTL, snapshots plan control_epoch і secret_epoch. |
@@ -159,9 +161,11 @@ AWS SDK створюється з явно заданими endpoint, region, cr
 
 Файл шифрується застосунком до upload: draft — під KEK, sealed — під DEK секрету. Save дешифрує draft і створює новий зашифрований об'єкт; S3 Copy або перейменування не замінює перешифрування. За ліміту 10 MiB використовується один PutObject із bounded buffer; multipart pipeline у V1 не потрібний. AEAD tag перевіряється повністю до передачі будь-якого plaintext одержувачу. ETag не вважається криптографічною перевіркою.
 
-Спочатку SQL фіксує upload attempt, revision чернетки, object IDs та reservation квоти. Upload виконується поза SQL-транзакцією; один key завжди відповідає тим самим ciphertext bytes. Після успішного upload усіх файлів коротка транзакція перевіряє revision, lease, owner/control epochs та разом зберігає references, frozen policy, code envelopes і cleanup jobs. Лише цей commit означає Save. Між S3 та PostgreSQL немає спільної транзакції; повтор завершеного Save повертає тільки статус.
+Перед upload SQL зберігає FileObject reservation: object/operation/draft IDs, object key, розмір, стан `pending` і `due_at`, початково через одну добу. Upload виконується поза SQL-транзакцією з обмеженими buffers і S3 timeout; один key завжди відповідає тим самим ciphertext bytes. Після I/O прикріплення файла атомарно оновлює чернетку та стан об'єкта після повторної перевірки прав і TTL. Фінальна транзакція Save перевіряє revision чернетки, owner/control epochs і разом зберігає references, frozen policy, code envelopes та cleanup jobs. Лише цей commit означає Save. Окремого upload lease немає: облік незавершеного I/O спирається на pending reservations, строки GC і повторну валідацію перед commit. Між S3 та PostgreSQL немає спільної транзакції; повтор завершеного Save повертає тільки статус.
 
-Якщо збій стався до commit, draft залишається джерелом повторної спроби. Частково завантажені об'єкти не стають секретом. Якщо процес втратив матеріал незавершеного шифрування, нова спроба використовує нові DEK/object IDs; попередня прибирається як orphan. GC працює через наявні PostgreSQL jobs: видаляє лише об'єкти завершених/прострочених attempts без чинних references, після блокування та повторної перевірки. Активний upload захищено lease; attach до DeletePending заборонений. Sweeper повторно прибирає пізній PUT від уже простроченого attempt.
+Якщо операція завершилася помилкою до commit, процес продовжує працювати й TTL чернетки не минув, draft залишається джерелом повторної спроби. Після перезапуску незавершені чернетки анулюються за правилом нижче. Частково завантажені об'єкти не стають секретом. Нова спроба Save використовує нові DEK/object IDs; попередні незавершені об'єкти прибираються як orphan. Scheduler вибирає з PostgreSQL об'єкти у стані `pending` або `gc`, для яких настав `due_at`; після S3 Delete/Head стан перечитується під блокуванням плану перед оновленням GC-запису. Стани `draft` і `sealed` не є кандидатами цього сканування. Прикріплення до видаленого scope, простроченої чернетки, застарілого owner_epoch або плану з pending_control відхиляється. GC повторно перевіряє збережені keys, щоб прибрати пізній PUT.
+
+Під час startup replay незавершені чернетки анулюються, їхні тимчасові файли переходять до очищення, а власник отримує повідомлення. Це свідомий компроміс: чернетка не переживає перезапуск, зате відновлення snapshot до Save не повертає читання вже запечатаного вмісту через стару чернетку. Збережені secret versions ця процедура не видаляє.
 
 Після Save доступ owner до draft-файлів і preview закрито одразу, навіть якщо cleanup ще триває. Видалення спочатку фіксує tombstone та припиняє доступ; object keys для очищення зберігаються до підтвердженого DeleteObject або NotFound. Для незавершеного/простроченого upload перший Delete не прибирає GC-запис: необхідні припинення старих upload/retry workers і повторне очищення після їхніх запитів. Поки можливий пізній PUT або результат такого запиту невизначений, key зберігається, sweeper повторює перевірку, а cleanup лишається pending. Timeout/5xx не означає видалення. Відсутній чи пошкоджений Attached object блокує видачу відповідного секрету та створює помилку, а не обхід правил.
 
@@ -283,7 +287,7 @@ Collecting має TTL 30 днів; прострочені submissions очища
 
 ### 7.3. Транзакції та гонки
 
-Рішення щодо одного профілю серіалізуються row lock; стабільний порядок блокувань: profile → plan → secret/case → delivery part. Використовуються короткі транзакції, unique constraints і повторення транзакції при transient serialization/deadlock failure. `SKIP LOCKED` застосовується для claim jobs, не для пропуску перевірок доступу. [PostgreSQL locking](https://www.postgresql.org/docs/18/explicit-locking.html), [queue-like SELECT](https://www.postgresql.org/docs/18/sql-select.html).
+Операції в межах плану серіалізуються транзакційним advisory lock за повним типізованим ID та row lock через `SELECT … FOR UPDATE`. Після блокування записи перечитуються для перевірки актуальних прав і стану. Прийняття запрошення бере блокування plan → invitation; перевірка dispatch — plan → job. Claim окремого job виконується у власній короткій транзакції з блокуванням цього job. Unique constraints захищають ідентичність і логічну унікальність записів. Загального SQL retry wrapper і `SKIP LOCKED` у поточному адаптері немає; після помилки транзакція відкочується, а правила повторення визначає відповідна операція або worker. [PostgreSQL locking](https://www.postgresql.org/docs/18/explicit-locking.html).
 
 STOP плану, recovery, CheckIn із відкритою справою та видалення плану збільшують plan control_epoch і скасовують ще не відправлені intents. Скасування/видалення окремого секрету змінює лише його secret_epoch; сусідні секрети продовжують незалежну роботу. Worker перед Dispatching повторно перевіряє обидва epochs, стан профілю/плану/справи, час, quorum, адресата й operational hold. Claim задачі ще не є дозволом надсилати.
 
@@ -293,7 +297,7 @@ STOP плану, recovery, CheckIn із відкритою справою та �
 
 Перед видачею потрібні актуальний успішний polling, оброблений inbox і відсутність відомого збою нагадувань. Restart/DB outage/polling gap понад 2 хвилини ставить зачеплені передачі в operational hold. Після відновлення backlog обробляється до нових release jobs.
 
-Якщо немає ризику втрати updates, власнику повторюється повідомлення, а earliest release переноситься не раніше ніж на повний release_delay після відновлення. Якщо перерва перевищила 24 години, події Telegram могли зникнути: старих approvals недостатньо, потрібен новий case із повторними підтвердженнями. Простій не імітує смерть і не спричиняє масової видачі. [Зберігання updates](https://core.telegram.org/bots/api#getting-updates).
+Якщо немає ризику втрати updates, власнику повторюється повідомлення, а earliest release переноситься не раніше ніж на повний release_delay після відновлення. Якщо перерва перевищила 24 години, події Telegram могли зникнути: старих approvals недостатньо, потрібен новий case із повторними підтвердженнями. Простій сервісу не є свідченням неспроможності власника керувати даними й не спричиняє масової видачі. [Зберігання updates](https://core.telegram.org/bots/api#getting-updates).
 
 ## 8. Recovery, голосування та видалення
 
@@ -349,7 +353,7 @@ Jobs/outbox — локальні записи роботи й намірів д�
 
 Брокер не замінює шифрування, авторизацію, перевірку скасування або облік невизначеної доставки. Зокрема, гарантії Kafka не роблять HTTP-відправлення до Telegram автоматично exactly-once: для зовнішнього одержувача потрібна його участь у протоколі. [Гарантії доставки Kafka](https://kafka.apache.org/41/design/design/#message-delivery-semantics).
 
-Jobs мають available_at, lease_until, attempt_id, lease_token, locked_by, dedup key. Claim — коротка транзакція `FOR UPDATE SKIP LOCKED`; виконання й завершення — окремі операції. Кожен перехід до Dispatching — compare-and-set за актуальними token, станом і строком lease. Прострочений Claimed можна повернути в чергу з новим token, але прострочений Dispatching переходить у Unknown, а не у сліпий повтор. Явний retry створює нову attempt; пізня відповідь попереднього worker дописує тільки його attempt, не перезаписує нову. Відомий успішний результат зберігається навіть після STOP, щоб UI не приховав фактичну доставку.
+Jobs мають due_at, expires_at, lease_until, lease_token, пріоритет і кількість спроб; результати спроб зберігаються в delivery_attempts. Claim — коротка транзакція з advisory lock і `FOR UPDATE` для конкретного job; виконання й завершення — окремі операції. Кожен перехід до Dispatching — compare-and-set за актуальними token, станом і строком lease. Прострочений Claimed можна повернути в чергу з новим token, але прострочений Dispatching для відправлення переходить у Unknown. Ідемпотентні cleanup jobs можна повторювати після втрати worker. Явний retry створює нову attempt; пізня відповідь попереднього worker дописує тільки його attempt, не перезаписує нову. Відомий успішний результат зберігається навіть після STOP, щоб UI не приховав фактичну доставку.
 
 Перший дозволений release створює незмінний manifest частин для кожного recipient, зашифрований DEK секрету; файли представлені посиланнями на sealed objects. Manifest переживає expiry case та містить точне оформлення. Ledger logical parts не залежить від case/generation: наступний case дозволяє лише нові спроби недоставлених частин, а не створює весь набір заново.
 
@@ -396,7 +400,7 @@ Jobs мають available_at, lease_until, attempt_id, lease_token, locked_by, d
 
 ## 11. Українська й англійська локалізації
 
-Порядок вибору: явна мова користувача → negotiation Telegram language_code → `en`. `uk-UA` відповідає `uk`, `en-GB` — `en`; непідтримувана або відсутня мова дає англійський інтерфейс. Меню зміни мови доступне завжди. [Telegram User](https://core.telegram.org/bots/api#user).
+Порядок вибору: явна мова користувача → negotiation Telegram language_code → `en`. `uk-UA` відповідає `uk`, `en-GB` — `en`; непідтримувана або відсутня мова дає англійський інтерфейс. Вибір мови доступний через «Налаштування → Мова», зокрема без створеного плану; поточний вибір позначається. [Telegram User](https://core.telegram.org/bots/api#user).
 
 Fluent resources завантажуються та перевіряються на старті. Зберігаються і бажана мова, і resolved locale. Для shared runtime використовується concurrent FluentBundle; mutable bundle не ділиться між задачами без належного захисту.
 
@@ -413,22 +417,22 @@ Domain повертає стабільний error code і безпечні па
 | Процес | Вимоги |
 | --- | --- |
 | app | Один replica, non-root UID, read-only root filesystem, tmpfs для тимчасових даних, без core dumps; вихід до Telegram, PostgreSQL та локального S3. Початковий бюджет 2 CPU / 768 MiB. |
-| db | PostgreSQL 18.6, named volume, без host port у production; healthcheck pg_isready. Окремі bootstrap, migration і runtime ролі. Початковий бюджет 1 CPU / 768 MiB. |
+| db | PostgreSQL 18.6, named volume, без host port у production; healthcheck pg_isready. Поточний локальний Compose використовує спільну роль для міграцій і runtime. Початковий бюджет 1 CPU / 768 MiB. |
 | object-storage | Garage 2.4.0, `/garage server --single-node`, replication_factor=1; окремі volumes для data і metadata, без опублікованих host ports. Початковий бюджет 1 CPU / 512 MiB; healthcheck `["CMD", "/garage", "health"]`. |
 | migrate | Одноразова команда того самого app image; завершується до старту app, не є окремим постійним сервісом. |
 | storage-init | Одноразова ідемпотентна команда app image: створити/перевірити bucket та application key через Garage Admin API; окремий admin credential тільки для цієї команди. |
 
-Compose dependency order: db service_healthy → migrate service_completed_successfully → app. Це startup gating; runtime втрата БД окремо переводить застосунок у degraded/hold. App має окремий writable volume для control journal; він не входить до read-only root filesystem або PostgreSQL volume. [Compose startup order](https://docs.docker.com/compose/how-tos/startup-order/).
+Compose dependency order: db service_healthy → migrate service_completed_successfully → app; app також очікує успішний storage-init. Команда `docker compose up -d` автоматично готує базу, object storage і журнал. App після отримання database leadership створює журнал лише для порожнього каталогу й невикористаної БД без bot binding, прикладних записів і maintenance hold. Наявний журнал перевіряється та використовується повторно; відсутній журнал використаної інсталяції або неповна/пошкоджена історія блокують запуск. Це startup gating; runtime втрата БД окремо переводить застосунок у degraded/hold. App має окремий writable volume для control journal; він не входить до read-only root filesystem або PostgreSQL volume. [Compose startup order](https://docs.docker.com/compose/how-tos/startup-order/).
 
 Паралельна гілка: object-storage service_healthy → storage-init. Застосунок очікує успішної перевірки bucket/credentials перед файловими операціями; готовність control commands не залежить від S3, зокрема після рестарту під час збою сховища. Помилка ініціалізації відображається як storage unavailable, без fallback до зберігання файлів у PostgreSQL.
 
-Garage: `metadata_dir=/var/lib/garage/meta`, `data_dir=/var/lib/garage/data`, `db_engine="sqlite"`, `metadata_fsync=true`, `data_fsync=true`, `compression_level="none"` для вже зашифрованих байтів. SQLite тут внутрішня metadata engine Garage, а не додатковий сервіс застосунку. RPC/admin secrets читаються через підтримувані `rpc_secret_file` і `admin_token_file`; secrets-файли мають обмежені права. Web hosting не вмикається. S3/admin доступні тільки в приватній мережі Compose; звичайний app не має admin credential. HTTP допускається лише в цій локальній мережі довіреного host; зовнішній endpoint потребуватиме TLS. [Garage configuration](https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/).
+Garage: `metadata_dir=/var/lib/garage/meta`, `data_dir=/var/lib/garage/data`, `db_engine="sqlite"`, `metadata_fsync=true`, `data_fsync=true`, `compression_level="none"` для вже зашифрованих байтів. SQLite тут внутрішня metadata engine Garage, а не додатковий сервіс застосунку. RPC/admin secrets надходять через `GARAGE_RPC_SECRET` і `GARAGE_ADMIN_TOKEN`. Web hosting не вмикається. S3/admin доступні тільки в приватній мережі Compose; звичайний app не має admin credential. HTTP допускається лише в цій локальній мережі довіреного host; зовнішній endpoint потребуватиме TLS. [Garage configuration](https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/).
 
-Bucket `secret-files` отримує окремий app key із read/write лише цього bucket та без owner/admin повноважень. Storage-init імпортує вже згенеровану пару ключів із Compose secrets, не друкує її й не ротує при кожному restart. Backup використовує окремий read credential. Образ Garage мінімальний: healthcheck використовує його CLI, не передбачає shell/curl. [Garage startup](https://garagehq.deuxfleurs.fr/documentation/quick-start/).
+За замовчуванням використовується приватний bucket `zapovit`. Storage-init ідемпотентно імпортує `S3_ACCESS_KEY_ID` і `S3_SECRET_ACCESS_KEY` через Garage Admin API. Ці credentials генеруються разом із `.env`. Ключ має read/write для цього bucket, без bucket-owner і create-bucket повноважень; admin token не передається runtime. При повторному запуску storage-init перевіряє той самий ключ і відновлює призначення прав, не друкує секрет і не створює заміну лише через restart. Поточні export/import використовують той самий application credential. Окремий read-only credential для виробничого backup-експорту є подальшим розмежуванням привілеїв, ще не реалізованим у Compose. Образ Garage мінімальний: healthcheck використовує його CLI, не передбачає shell/curl. [Garage startup](https://garagehq.deuxfleurs.fr/documentation/quick-start/).
 
 Один host і replication_factor=1 не забезпечують HA або резервування диска. Офіційний quick start застерігає від production single-node без redundancy; наш початковий режим приймає цю межу з окремими backups і перевіреним restore, не видає named volume за резервну копію. Кластер не є вимогою V1.
 
-PostgreSQL 18 volume монтується в `/var/lib/postgresql`, стандартний PGDATA — `/var/lib/postgresql/18/docker`. Ініціалізація створює `zapovit_migrator` як власника схеми й `zapovit_app` із потрібними DML-правами, без superuser/DDL. POSTGRES_USER image не використовується як runtime account. [Офіційний PostgreSQL image](https://github.com/docker-library/docs/blob/master/postgres/README.md).
+PostgreSQL 18 volume монтується в `/var/lib/postgresql`, стандартний PGDATA — `/var/lib/postgresql/18/docker`. Поточний Compose створює роль `zapovit` через `POSTGRES_USER` і використовує її для міграцій та runtime. Окремий власник схеми й runtime-роль з обмеженими DML-правами ще не налаштовані; їхнє розмежування та перевірка привілеїв залишаються умовою виробничого допуску. [Офіційний PostgreSQL image](https://github.com/docker-library/docs/blob/master/postgres/README.md).
 
 Multi-stage build: builder на Debian bookworm, runtime bookworm-slim з CA certificates. На дату перевірки rust:1.98.1-bookworm ще не опубліковано; використовувати перевірений builder 1.98.0 і встановити exact toolchain 1.98.1 перед `cargo +1.98.1 build --release --locked`.
 
@@ -445,33 +449,15 @@ dxflrs/garage:v2.4.0@sha256:715d176efc35384bf72cf6052fd61b74b3e27a1e31a9dfedabe6
 
 ### 12.2. Environment contract
 
-Усі application settings мають префікс `ZAPOVIT_`. Defaults → конфігураційний файл → ENV; секрети завантажуються явно з `_FILE`, а не через довільний Debug конфігурації. Відсутній ключ, некоректні строки або несумісна схема зупиняють startup.
+Runtime settings використовують назви без префікса проєкту: defaults → ENV. Застосунок читає лише явно підтримувані змінні й ігнорує сторонні. Некоректні значення, порушення bounds, відсутній обов'язковий ключ або несумісна схема зупиняють startup. Чинні назви та defaults наведено в [інструкції запуску](operations.md#configuration); вона відповідає `adapters::settings::Settings`.
 
-| Змінна | Значення / призначення |
-| --- | --- |
-| APP_ENV | local, test, production. |
-| TELEGRAM_BOT_TOKEN_FILE | Шлях до Compose secret; окремий бот для кожного середовища. |
-| DATABASE_URL_FILE | Runtime connection string; migration URL надається лише migrate-процесу. |
-| S3_ENDPOINT / S3_REGION / S3_BUCKET | http://object-storage:3900 / garage / secret-files; окремі інсталяції та credentials для кожного середовища. |
-| S3_ACCESS_KEY_ID_FILE / S3_SECRET_ACCESS_KEY_FILE | Credentials застосунку через Compose secrets; без прав адміністратора сховища. |
-| S3_FORCE_PATH_STYLE / S3_TIMEOUT_SECONDS / S3_CONCURRENCY | true / 60 / 2; спільний бюджет із file transfers. |
-| STORAGE_ADMIN_ENDPOINT / STORAGE_ADMIN_TOKEN_FILE | http://object-storage:3903 та admin secret; надаються лише storage-init. |
-| KEYRING_FILE | Versioned KEK keyring, active key ID і дозволені старі decrypt keys. |
-| GUARDIAN_VERIFIER_KEYRING_FILE | Окремі versioned HMAC keys для перевірки codes. |
-| CONTROL_JOURNAL_PATH | Шлях на окремому durable volume; доступність і цілісність обов'язкові для control mutations. |
-| DEFAULT_LOCALE / SUPPORTED_LOCALES | en / uk,en. |
-| DATABASE_POOL_MAX / WORKER_COUNT | 10 / 4. |
-| POLL_TIMEOUT_SECONDS / SCHEDULER_TICK_SECONDS | 30 / 5. |
-| MAX_FILE_BYTES / MAX_PROFILE_BYTES | 10485760 / 262144000. |
-| DEFAULT_REMINDER_DAYS / DEFAULT_INACTIVITY_DAYS / DEFAULT_RELEASE_DELAY_DAYS | 7 / 28 / 7. |
-| ARGON2_MEMORY_KIB / ARGON2_ITERATIONS / ARGON2_PARALLELISM / ARGON2_CONCURRENCY | 65536 / 3 / 1 / 2. |
-| GLOBAL_SEND_RATE / PER_CHAT_SEND_RATE | 20 / 1 за секунду. |
-| HOLD_AFTER_GAP_SECONDS / MAINTENANCE_MODE | 120 / false; restore завжди починається з true. |
-| HEALTH_BIND / LOG_LEVEL | Внутрішній :8080 / info. |
+Настроюються `DATA_MODE`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `KEK_KEYRING`, `VERIFIER_KEYRING`, `JOURNAL_KEYRING`, `JOURNAL_DIR`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `TELEGRAM_API_BASE`, `HEALTH_BIND`, `WORKERS`, `DATABASE_POOL`. Keyring-змінні містять JSON із полями `active` і `keys`; значення ключів — base64url-кодування 32 випадкових байтів. Compose читає `.env` і передає settings потрібним контейнерам; сам Rust binary `.env` не завантажує. `APP_UID` і `APP_GID` визначають користувача app-контейнера; `DATABASE_PASSWORD` передається PostgreSQL і має відповідати `DATABASE_URL`. `GARAGE_RPC_SECRET` і `GARAGE_ADMIN_TOKEN` використовують Garage та bootstrap, без передачі admin token боту. Maintenance змінюється окремою командою та зберігається в БД. Timing налаштовується через діалог і фіксується в policy секрету.
 
-Решта таблиці лімітів також представлена типізованими settings із відповідними назвами й валідацією. Подвійне задання секрету inline і через `_FILE` відхиляється. Keyring не лежить у тій самій БД, яку він захищає. Старий KEK прибирається лише після rewrap чинних службових об'єктів і завершення retention. HMAC verifiers без часток перерахувати неможливо: старий verifier key зберігається, поки є залежні секрети, або verifiers оновлюються під час автентифікованої повторної подачі відповідних кодів. Компрометація ключа не виправляється простим перейменуванням key ID.
+Решта ресурсних і криптографічних лімітів наразі є константами реалізації, а не ENV-перемикачами. Файлового config layer та автоматичного rewrap ключів немає. Runtime і migrate у поточному локальному Compose використовують одну роль БД; окремі ролі й перевірка мінімальних SQL-привілеїв залишаються умовою виробничого допуску.
 
-Compose secrets з file source — файлові монтування, а не зовнішній secret manager. На host потрібні обмежені права та окремий порядок backup ключів. [Compose secrets](https://docs.docker.com/compose/how-tos/use-secrets/).
+Keyring не лежить у тій самій БД, яку він захищає. Старий KEK прибирається лише після rewrap чинних службових об'єктів і завершення retention. HMAC verifiers без часток перерахувати неможливо: старий verifier key зберігається, поки є залежні секрети, або verifiers оновлюються під час автентифікованої повторної подачі відповідних кодів. Компрометація ключа не виправляється простим перейменуванням key ID.
+
+`generate-env --output .env` створює credentials і keyrings автоматично, записує файл із правами `0600` та відмовляється перезаписувати наявний. Власник інсталяції задає `TELEGRAM_BOT_TOKEN`; окрема host-папка із секретами не потрібна. Backup зберігає фактичну конфігурацію запущених контейнерів у `runtime.env` всередині зашифрованого архіву, разом із БД, object payload та журналом.
 
 Local використовує окремого test bot; CI — фальшивий Telegram server і тимчасову PostgreSQL. Production token та копії реальних payload не використовуються у local/test. Під час startup getMe перевіряє bot ID проти deployment binding у БД, щоб випадково не підключити інше середовище.
 
@@ -479,9 +465,9 @@ Local використовує окремого test bot; CI — фальшив�
 
 Заплановані команди binary: `serve`, `migrate`, `storage-init`, `check-config`, `healthcheck`; допоміжні key-generation/backup operations не виводять секрети у logs. Після міграцій workers стартують тільки з очікуваною schema version.
 
-Liveness перевіряє процес/event loop; readiness — БД, схему й готовність ingestion; доступність object storage відображається окремо. Збій S3 блокує збереження/видачу файлів, але не STOP, CheckIn або текстові статуси. Operational hold відображається окремо. Health endpoints доступні лише всередині deployment; це не користувацький API.
+Liveness перевіряє процес/event loop. Readiness оновлюється за успішною ітерацією scheduler, актуальним polling і відсутністю inbox backlog; схема й migration checksums перевіряються під час startup. Помилки S3 повертаються як `storage_unavailable`; окремого S3 health endpoint наразі немає. Збереження/видача файлів потребують S3, а STOP, CheckIn і текстові статуси — ні. Operational hold відображається окремою метрикою. Health endpoints доступні лише всередині deployment; це не користувацький API.
 
-Метрики: poll age, inbox/outbox lag, failed jobs, Unknown deliveries, hold duration, Argon2 queue, cleanup failures, DB pool saturation, S3 latency/errors і pending/orphan bytes. Labels не містять user IDs, назв секретів або payload. Logs мають correlation IDs і коди результатів; bot-token URL, SQL bind values, коди, файли й Telegram update bodies редагуються або не логуються.
+Метрики містять кількість необроблених inbox events, queued/claimed/retryable jobs, Unknown deliveries і permanent failures; вік останнього poll, залишок operational hold, байти pending/GC objects, кількість з'єднань та idle connections у DB pool. Вони не мають labels із user IDs, назвами секретів або payload. Окремих Argon2 queue і S3 latency/error метрик наразі немає. Logs містять імена службових подій і безпечні коди помилок; bot-token URL, SQL bind values, коди, файли й Telegram update bodies не логуються.
 
 Graceful shutdown припиняє нові claims, завершує короткі транзакції та фіксує in-flight sends як Sent/Unknown. HTTP-запит не повторюється автоматично лише через рестарт контейнера.
 
@@ -506,15 +492,15 @@ Graceful shutdown припиняє нові claims, завершує корот�
 
 Unit/property tests — переходи й invariants із керованим Clock. Integration tests — реальні PostgreSQL і локальне S3 тієї самої версії, що в Compose, та fake Telegram endpoint. S3 contract tests перевіряють підпис запитів, PUT/GET/HEAD/DELETE і checksum settings обраного SDK. Контрактні тести окремого test bot перевіряють лише синтетичні тексти/файли й cleanup. Crypto module потребує незалежних векторів; сам round-trip тест недостатній.
 
-CI: cargo fmt --check; cargo clippy --locked --workspace --all-targets з warnings-as-errors; cargo test --locked --workspace; dependency/container scans; перевірка локалей. SQLx metadata комітиться, offline build перевіряється окремо від schema drift:
+CI: cargo fmt --check; cargo clippy --locked --workspace --all-targets з warnings-as-errors; cargo test --locked --workspace; cargo-audit/cargo-deny; перевірка локалей і Compose. Поточний SQL-адаптер використовує параметризовані runtime-запити; назви таблиць беруться лише із закритого enum. Окремого `.sqlx` cache немає: schema drift перевіряють міграції та інтеграційні тести, а збірка не потребує доступу до БД.
 
 ```text
-SQLX_OFFLINE=true cargo check --locked --workspace --all-targets
-cargo sqlx migrate run
-cargo sqlx prepare --check --workspace -- --all-targets
+cargo check --locked --workspace --all-targets
+cargo run --locked --bin zapovit -- migrate
+cargo test -p adapters --test pipeline --locked -- --include-ignored --test-threads=1
 ```
 
-Міграції й prepare --check запускаються проти чистої PostgreSQL тієї самої major/minor. Набори Cargo features перевіряються явною матрицею, якщо вони взаємовиключні. [SQLx CLI](https://github.com/transact-rs/sqlx/blob/v0.9.0/sqlx-cli/README.md).
+CI використовує PostgreSQL 18.6. Фактично виконані локальні перевірки, версії середовища та неперевірені умови deployment записані окремо у [звіті перевірки](verification.md).
 
 ## 14. Порядок реалізації та розширення
 
@@ -529,4 +515,4 @@ cargo sqlx prepare --check --workspace -- --all-targets
 
 Масштабування визначається виміряним навантаженням і новими вимогами. За потреби можна окремо запустити workers, змінити ingress або мігрувати частину роботи до брокера; V1 не містить Kafka-клієнта, універсального QueueProvider чи альтернативних транспортів про запас. Таку міграцію проєктують окремо зі збереженням ідемпотентності, скасування та станів доставки. Поточні межі модулів дозволяють локалізувати зміни; безкоштовна заміна транспорту не обіцяється. Object storage уже входить до V1; його кластеризація, розділення застосунку на сервіси, публічний API та багатоступеневий engine додаються за реальною потребою.
 
-Невирішений до виробничого допуску пункт — доказ перевірки обраної threshold-бібліотеки та її інтеграції. Числові defaults і ресурсні бюджети є стартовими рішеннями; їх підтверджують benchmark і тестове розгортання. Функціональні потоки визначено, але реалізація, спільна збірка залежностей та аудит застосунку цим документом не заявляються виконаними.
+Невирішений до виробничого допуску пункт — доказ перевірки обраної threshold-бібліотеки та її інтеграції. Числові defaults і ресурсні бюджети є стартовими рішеннями; їх підтверджують benchmark і тестове розгортання. Реалізований synthetic-сценарій і спільну збірку перевірено в межах, описаних у [звіті перевірки](verification.md). Ці результати не замінюють незалежний аудит застосунку та решту перевірок виробничого допуску.

@@ -1,0 +1,9 @@
+/target/
+/.local/
+/.secrets/
+/.env
+/.env.*
+!.env.example
+/debug-tools/runtime/
+*.log
+__pycache__/

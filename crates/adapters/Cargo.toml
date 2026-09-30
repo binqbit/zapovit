@@ -1,0 +1,44 @@
+[package]
+name = "adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+[dependencies]
+domain.workspace = true
+application.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+time.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+zeroize.workspace = true
+secrecy.workspace = true
+getrandom.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+vsss-rs.workspace = true
+rand_core.workspace = true
+base64.workspace = true
+hex.workspace = true
+sqlx.workspace = true
+reqwest.workspace = true
+teloxide-core.workspace = true
+aws-sdk-s3.workspace = true
+aws-credential-types.workspace = true
+fluent-bundle.workspace = true
+unic-langid.workspace = true
+fluent-langneg.workspace = true
+config.workspace = true
+tracing.workspace = true
+futures-util.workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+axum.workspace = true
+[lints]
+workspace = true

@@ -1,0 +1,122 @@
+name: zapovit
+
+x-app: &app
+  image: zapovit:local
+  build: .
+  pull_policy: build
+  user: "${APP_UID:-10001}:${APP_GID:-10001}"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - "/tmp:size=16m,mode=1777"
+  networks: [private, outbound]
+  environment: &environment
+    DATA_MODE: ${DATA_MODE:-synthetic}
+    DATABASE_URL: ${DATABASE_URL:-}
+    KEK_KEYRING: ${KEK_KEYRING:-}
+    VERIFIER_KEYRING: ${VERIFIER_KEYRING:-}
+    JOURNAL_KEYRING: ${JOURNAL_KEYRING:-}
+    S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+    S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+    S3_ENDPOINT: http://object-storage:3900
+    S3_REGION: garage
+    S3_BUCKET: zapovit
+    HEALTH_BIND: 0.0.0.0:8080
+    JOURNAL_DIR: /var/lib/zapovit/journal
+    TELEGRAM_API_BASE: ${TELEGRAM_API_BASE:-https://api.telegram.org}
+    WORKERS: ${WORKERS:-4}
+    DATABASE_POOL: ${DATABASE_POOL:-10}
+  volumes:
+    - control-journal:/var/lib/zapovit/journal
+
+services:
+  app:
+    <<: *app
+    command: [serve]
+    environment:
+      <<: *environment
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    restart: unless-stopped
+    stop_grace_period: 75s
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      storage-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, /usr/local/bin/zapovit, healthcheck]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 45s
+    mem_limit: 1g
+    pids_limit: 256
+
+  migrate:
+    <<: *app
+    command: [migrate]
+    restart: "no"
+    volumes: []
+    depends_on:
+      db: {condition: service_healthy}
+
+  storage-init:
+    <<: *app
+    command: [storage-init]
+    restart: "no"
+    environment:
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+    volumes: []
+    depends_on:
+      object-storage: {condition: service_started}
+
+  db:
+    image: postgres:18.6-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zapovit
+      POSTGRES_DB: zapovit
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-}
+      POSTGRES_INITDB_ARGS: --data-checksums --auth-host=scram-sha-256
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    networks: [private]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U zapovit -d zapovit']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    shm_size: 128mb
+    mem_limit: 1g
+
+  object-storage:
+    image: dxflrs/garage:v2.4.0@sha256:715d176efc35384bf72cf6052fd61b74b3e27a1e31a9dfedabe646bd1e92f137
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ./config/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    networks: [private]
+    healthcheck:
+      test: [CMD, /garage, health]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    mem_limit: 1g
+
+networks:
+  private: {internal: true}
+  outbound: {}
+volumes:
+  postgres-data: {}
+  garage-meta: {}
+  garage-data: {}
+  control-journal: {}

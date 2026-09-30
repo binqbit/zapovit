@@ -1,0 +1,19 @@
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+metadata_fsync = true
+data_fsync = true
+replication_factor = 1
+consistency_mode = "consistent"
+compression_level = "none"
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "object-storage:3901"
+# GARAGE_RPC_SECRET is supplied by Compose from .env.
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+
+[admin]
+api_bind_addr = "[::]:3903"
+# GARAGE_ADMIN_TOKEN is supplied by Compose from .env.

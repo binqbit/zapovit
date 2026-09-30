@@ -1,0 +1,7 @@
+.git
+target
+.local
+.secrets
+.env*
+!.env.example
+debug-tools/runtime
