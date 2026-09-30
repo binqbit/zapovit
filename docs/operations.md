@@ -98,7 +98,7 @@ The script enables persisted maintenance, waits for bounded I/O to drain, export
 
 Backup helper containers use `--pull never` to reuse the local application image without pulling or rebuilding it during the backup.
 
-Schedule the script daily using the host scheduler. Delete archives older than seven days only after checking that a newer complete, decryptable backup exists. Never treat a PostgreSQL dump alone as a recoverable backup.
+The daily backup target is not ready for unattended deployment: every successful run currently applies a new 24-hour release hold, so running it daily can keep transmission held continuously. Separate normal backup completion from restore recovery before enabling that schedule; see the [improvement roadmap](roadmap.md). Delete archives older than seven days only after checking that a newer complete, decryptable backup exists. Never treat a PostgreSQL dump alone as a recoverable backup.
 
 Restore into an isolated installation first:
 
@@ -126,7 +126,7 @@ cargo deny check
 docker compose config --quiet
 ```
 
-The initial V1 schema is kept in one `migrations/0001_core.sql`. During this initial development, changes are consolidated into that file. SQLx still checks migration checksums: use a fresh disposable database/schema when the core changes. The application never resets an existing database automatically.
+The initial V1 schema is in `migrations/0001_core.sql`. Once an installation has applied it, preserve that file and add numbered migrations for subsequent schema changes. SQLx checks migration checksums; modifying an applied migration prevents startup. Tests use fresh disposable schemas. The application never resets an existing database automatically.
 
 Full-record administrative queries fail closed above 10,000 matching records; they never silently truncate backup exports. This implementation needs paginated administrative scans before operating beyond that bound.
 
@@ -142,5 +142,7 @@ TEST_DATABASE_URL=postgresql://USER:PASSWORD@127.0.0.1:5432/zapovit_test \
 Garage integration tests additionally require `TEST_S3_ENDPOINT` pointing to loopback and an **absolute** `TEST_S3_CREDENTIALS_FILE` path. Run `cargo test -p adapters --test transport --locked -- --include-ignored` with those variables.
 
 The earlier running-bot validation used local loopback Telegram and smoke-test helpers that are not included in this repository. The checked-in Rust tests above provide the available automated verification; they do not reproduce that full running-bot scenario.
+
+Development-only helpers, synthetic database clusters and test reports belong in `.agent-workspace/`, ignored by Git and excluded from Docker build contexts. A local helper can provision its own PostgreSQL, run the commands above and stop that cluster afterward; it must not load deployment credentials or target an existing database. Maintained tests and operational backup scripts remain tracked in `crates/*/tests` and `scripts/`. Neither the build nor CI depends on `.agent-workspace/`.
 
 See [verification results](verification.md) for evidence and environment limits.

@@ -1,5 +1,28 @@
 # Implementation verification
 
+## Repository and Telegram UX review on 30 September 2026
+
+Verified with Rust 1.98.1, native PostgreSQL 17.11, loopback Telegram mocks and synthetic fixtures. The pinned toolchain was selected explicitly because the host's default Cargo/Rust binaries were 1.97.1.
+
+| Check | Result |
+| --- | --- |
+| Formatting and lint | `cargo fmt --all -- --check` and all-target locked Clippy with warnings denied pass |
+| Default workspace suite | 42 passing tests; 42 external-service tests ignored by this command |
+| PostgreSQL pipeline | All 39 ignored cases pass across the full run and focused follow-ups, including three draft UX and four late-delivery regressions |
+| PostgreSQL application cases | Both leadership-loss and automatic journal startup tests pass |
+| Backup helpers and deployment syntax | Nine Python tests, `docker compose config --quiet`, and `bash -n scripts/backup.sh` pass |
+| Repository hygiene | Diff whitespace and local documentation links checked; `.agent-workspace/` is ignored by Git and excluded from Docker build contexts |
+
+This covers **83 distinct Rust tests** and **nine Python tests**. The full PostgreSQL pipeline initially passed 37 cases and failed two existing assertions that still expected the old generic error text/silent rate limit. Updated expectations preserve the authorization/state assertions; all four transport-validation cases and the menu-navigation case then passed on the final source. The initial failures and follow-up logs are retained in the local workspace.
+
+The late-delivery defect was reproduced before its fix: two of four new lifecycle regressions failed. After the fix all four pass. A late Unknown/Permanent/Sent result remains recorded without lifting a secret STOP, mutating a newer case, or reviving a deleted scope.
+
+Telegram verification covers draft/step/revision binding, preserving selections after Settings, correction of invalid timing, explicit cancellation/deletion scope, UTC status dates, bounded rate-limit feedback, ForceReply payloads and localized command registration. It does not demonstrate rendering in actual Telegram clients.
+
+Local helpers create and stop their own private PostgreSQL clusters; logs and reports live in `.agent-workspace/`. Maintained tests remain tracked and runnable without that directory. No real Telegram account was contacted. Garage integration, the Docker image/Compose runtime and a complete backup/restore were not executed in this review; Docker daemon access was denied. PostgreSQL 17 checks do not replace the pinned PostgreSQL 18.6 CI target. Newly identified operational work is recorded in the [roadmap](roadmap.md).
+
+## Earlier validation
+
 Full local validation was reported on 7 September 2026 with synthetic data. The results are summarized below; the separate validation and security report is not included in this repository.
 
 ## Environment configuration follow-up

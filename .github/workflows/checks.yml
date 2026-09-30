@@ -27,5 +27,6 @@ jobs:
       - run: cargo test -p app --test startup --locked -- --include-ignored
       - run: docker compose config --quiet
       - run: python3 scripts/test_backup_env.py
+      - run: bash -n scripts/backup.sh
       - run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit
       - run: cargo install cargo-deny --version 0.20.2 --locked && cargo deny check

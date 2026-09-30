@@ -4,6 +4,6 @@
 /.env
 /.env.*
 !.env.example
-/debug-tools/runtime/
+/.agent-workspace/
 *.log
 __pycache__/

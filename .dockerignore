@@ -4,4 +4,6 @@ target
 .secrets
 .env*
 !.env.example
-debug-tools/runtime
+.agent-workspace
+__pycache__
+*.log
